@@ -227,8 +227,8 @@ APP_SECRET_TARGET = os.getenv('APP_SECRET_TARGET')
 REFRESH_TOKEN_TARGET = os.getenv('REFRESH_TOKEN_TARGET')
 
 # Supabase (JSON contract storage, vervangt Dropbox TARGET voor bestanden)
-SUPABASE_URL = os.getenv('SUPABASE_URL')
-SUPABASE_SERVICE_KEY = os.getenv('SUPABASE_SERVICE_KEY')
+SUPABASE_URL = os.getenv('SUPABASE_URL') or os.getenv('NEXT_PUBLIC_SUPABASE_URL')
+SUPABASE_SERVICE_KEY = os.getenv('SUPABASE_SERVICE_KEY') or os.getenv('SUPABASE_SERVICE_ROLE_KEY')
 
 # EMAIL
 SMTP_SERVER = os.getenv('SMTP_SERVER', 'smtp.gmail.com')
@@ -1256,10 +1256,10 @@ def init_clients():
         ensure_csv_exists(dbx_target)
 
         # Supabase via REST API (geen pip-pakket: lokale map supabase/ zou die overschaduwen)
-        _url = (os.getenv('SUPABASE_URL') or SUPABASE_URL or '').strip().rstrip('/')
-        _key = (os.getenv('SUPABASE_SERVICE_KEY') or SUPABASE_SERVICE_KEY or '').strip()
+        _url = (os.getenv('SUPABASE_URL') or os.getenv('NEXT_PUBLIC_SUPABASE_URL') or SUPABASE_URL or '').strip().rstrip('/')
+        _key = (os.getenv('SUPABASE_SERVICE_KEY') or os.getenv('SUPABASE_SERVICE_ROLE_KEY') or SUPABASE_SERVICE_KEY or '').strip()
         if not _url or not _key:
-            raise RuntimeError("SUPABASE_URL of SUPABASE_SERVICE_KEY ontbreekt in .env.local. Zet ze (Supabase Dashboard → Settings → API) en draai opnieuw.")
+            raise RuntimeError("SUPABASE_URL en SUPABASE_SERVICE_KEY (of NEXT_PUBLIC_SUPABASE_URL en SUPABASE_SERVICE_ROLE_KEY) ontbreken in .env.local. Zet ze in Supabase Dashboard → Settings → API.")
         try:
             import requests
         except ImportError:
@@ -1271,6 +1271,10 @@ def init_clients():
             timeout=10,
         )
         if r.status_code not in (200, 206):
+            if r.status_code == 401:
+                raise RuntimeError(
+                    "Supabase 401: verkeerde API-key. Gebruik de service_role key (Supabase → Settings → API → Project API keys → service_role), niet de anon key. Zet die in .env.local als SUPABASE_SERVICE_ROLE_KEY."
+                )
             raise RuntimeError(f"Supabase bereikbaar maar fout: {r.status_code}. Controleer SUPABASE_URL en SUPABASE_SERVICE_KEY.")
         logger.info("✅ Supabase: JSON contract storage actief (REST API)")
 
