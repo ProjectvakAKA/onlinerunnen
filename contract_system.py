@@ -17,6 +17,7 @@ import smtplib
 import json
 import base64
 import re
+import signal
 import logging
 import functools
 from datetime import datetime, timedelta
@@ -24,6 +25,7 @@ from google import genai
 from google.genai import types
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from email.mime.image import MIMEImage
 from typing import Any, Dict, List, Optional, Set, Tuple, Callable
 from pdf2image import convert_from_bytes
 from PIL import Image
@@ -58,6 +60,35 @@ if _env_loaded_path:
 else:
     _existing = [p for p in _env_paths_to_try if os.path.isfile(p)]
     print("⚠ No .env.local loaded. Tried:", _env_paths_to_try[:3], "(existing:" + str(_existing) + ")")
+
+# Shutdown-flag voor Ctrl+C: tijdens lange API-calls reageert Python pas als de call klaar is.
+# Door een flag te zetten en in de loops te checken, stoppen we netjes na de huidige bewerking.
+_shutdown_requested = [False]  # list zodat de signal handler kan muteren
+
+def _sigint_handler(signum, frame):
+    _shutdown_requested[0] = True
+    print("\n⏹️  Stop aangevraagd (wacht tot huidige bewerking klaar is)...")
+
+# Zorg dat prompts uit dezelfde map als dit script geïmporteerd kunnen worden
+import sys
+if _script_dir not in sys.path:
+    sys.path.insert(0, _script_dir)
+from prompts import (
+    PROMPT_OCR_VISION,
+    PROMPT_ORGANIZE,
+    SOURCE_QUOTE_INSTRUCTION,
+    PROMPT_PARTIJEN,
+    PROMPT_PAND,
+    PROMPT_FINANCIEEL,
+    PROMPT_PERIODES,
+    PROMPT_VOORWAARDEN,
+    PROMPT_JURIDISCH,
+    PROMPT_METADATA,
+    PROMPT_SUMMARY,
+    EMAIL_SUBJECT,
+    EMAIL_BODY,
+    EMAIL_IMAGE_PATH,
+)
 
 # ============================================================================
 # LOGGING SETUP
@@ -162,7 +193,7 @@ def get_next_organize_key():
     return ok[best_i], best_i
 
 def get_next_extract_key():
-    """Volgende key voor extractie (KEY_9..20). Max 18 calls per key per 24u; na 24u tellers op 0."""
+    """Volgende key voor extractie (KEY_9..20). Max 18 calls per key per 24u. Teller wordt per API-call verhoogd via record_extract_use()."""
     ok = _load_organize_keys()
     ek = _load_extract_keys()
     if not ek:
@@ -182,9 +213,23 @@ def get_next_extract_key():
             best_i = i
     if best_i < 0 or ce[best_i] >= MAX_CALLS_PER_KEY_PER_24H:
         return None, -1
-    ce[best_i] += 1
-    _save_rotator_state(co, ce, next_reset_at)
     return ek[best_i], best_i
+
+
+def record_extract_use(key_idx: int) -> None:
+    """+1 op de extract-teller voor de gegeven key (na elke Gemini API-call tijdens extractie)."""
+    ok = _load_organize_keys()
+    ek = _load_extract_keys()
+    if key_idx < 0 or key_idx >= len(ek):
+        return
+    co, ce, next_reset_at = _load_rotator_state(ok, ek)
+    now = time.time()
+    if next_reset_at is None or now >= next_reset_at:
+        co = [0] * len(ok)
+        ce = [0] * len(ek)
+        next_reset_at = now + GEMINI_ONE_DAY_SECONDS
+    ce[key_idx] = ce[key_idx] + 1
+    _save_rotator_state(co, ce, next_reset_at)
 
 def get_gemini_key_rotator_state_summary():
     """Voor weergave: (pool, key_index, count, next_reset_at). Tellers zijn 0 als reset verstreken."""
@@ -228,7 +273,8 @@ REFRESH_TOKEN_TARGET = os.getenv('REFRESH_TOKEN_TARGET')
 
 # Supabase (JSON contract storage, vervangt Dropbox TARGET voor bestanden)
 SUPABASE_URL = os.getenv('SUPABASE_URL') or os.getenv('NEXT_PUBLIC_SUPABASE_URL')
-SUPABASE_SERVICE_KEY = os.getenv('SUPABASE_SERVICE_KEY') or os.getenv('SUPABASE_SERVICE_ROLE_KEY')
+# Voorkeur voor SERVICE_ROLE_KEY (service_role), anders SERVICE_KEY — zo wint de juiste key als beide gezet zijn
+SUPABASE_SERVICE_KEY = os.getenv('SUPABASE_SERVICE_ROLE_KEY') or os.getenv('SUPABASE_SERVICE_KEY')
 
 # EMAIL
 SMTP_SERVER = os.getenv('SMTP_SERVER', 'smtp.gmail.com')
@@ -251,8 +297,14 @@ ORGANIZED_HISTORY = os.path.join(_script_dir, "organized_history.txt")
 ANALYZED_HISTORY = os.path.join(_script_dir, "analyzed_docs.txt")
 FOLDER_CACHE = os.path.join(_script_dir, "folder_structure.json")
 
-# CSV log in TARGET
+# CSV log in TARGET (v2 = nieuw format met extracted_* kolommen; wordt automatisch gebruikt als oude CSV nog bestaat)
 CSV_LOG_PATH = "/verwerking_log.csv"
+CSV_LOG_PATH_NEW = "/verwerking_log_v2.csv"
+NEW_CSV_HEADER = (
+    'timestamp,filename,document_type,confidence_score,needs_review,text_length,fields_complete,'
+    'source_quote_pct,extracted_huurprijs,extracted_adres,extracted_ingangsdatum,extracted_verhuurder,extracted_huurder,'
+    'issues,warnings,json_path,processing_status\n'
+)
 
 # Retry settings
 MAX_RETRIES = 3
@@ -404,7 +456,22 @@ class ContractNormalizer:
                 return default
         return obj if obj != "" else default
 
+    def _safe_get_value(self, obj: Any, *keys: str, default: Any = None) -> Any:
+        """Like _safe_get but unwraps {value, source_quote, source_page} to the value string."""
+        v = self._safe_get(obj, *keys, default=default)
+        return _unwrap_field_value(v) if v is not None else default
+
+    def _get_field_for_output(self, obj: Any, *keys: str, default: Any = None) -> Any:
+        """Get field for output: if it's a dict with 'value' (and optionally source_quote/source_page), return that dict; else return the value."""
+        v = self._safe_get(obj, *keys, default=default)
+        if v is None or v == "":
+            return default
+        if isinstance(v, dict) and "value" in v:
+            return v
+        return v
+
     def _extract_number(self, value: Any) -> Optional[float]:
+        value = _unwrap_field_value(value)
         if value is None or value == "":
             return None
         if isinstance(value, (int, float)):
@@ -419,7 +486,18 @@ class ContractNormalizer:
                     pass
         return None
 
+    def _number_field_for_output(self, obj: Any, *keys: str) -> Any:
+        """Like _extract_number but preserves source_quote/source_page when present (for PDF highlight + UI)."""
+        v = self._safe_get(obj, *keys, default=None)
+        if v is None or v == "":
+            return None
+        num = self._extract_number(v)
+        if isinstance(v, dict) and "value" in v and (v.get("source_quote") is not None or v.get("source_page") is not None):
+            return {"value": num, "source_quote": v.get("source_quote"), "source_page": v.get("source_page")}
+        return num
+
     def _normalize_boolean(self, value: Any) -> Optional[bool]:
+        value = _unwrap_field_value(value)
         if value is None or value == "":
             return None
         if isinstance(value, bool):
@@ -434,6 +512,7 @@ class ContractNormalizer:
 
     def _normalize_date(self, value: Any) -> Optional[str]:
         """Returns date in YYYY-MM-DD format"""
+        value = _unwrap_field_value(value)
         if not value or value == "N/A":
             return None
         if isinstance(value, str):
@@ -447,7 +526,8 @@ class ContractNormalizer:
 
     def _normalize_contract_type(self, data: dict) -> str:
         ct = self._safe_get(data, 'contract_type') or self._safe_get(data, 'document_type') or self._safe_get(data, 'type')
-        return ct.lower() if ct else 'huurovereenkomst'
+        ct = _unwrap_field_value(ct) if ct is not None else None
+        return ct.lower() if (ct and isinstance(ct, str)) else 'huurovereenkomst'
 
     def _normalize_datum(self, data: dict) -> Optional[str]:
         date_value = self._safe_get(data, 'datum_contract') or self._safe_get(data, 'datum') or self._safe_get(data, 'contract_datum')
@@ -478,7 +558,7 @@ class ContractNormalizer:
         first_huurder = {}
         for h in huurders_list:
             if isinstance(h, dict):
-                naam = self._safe_get(h, 'naam')
+                naam = self._safe_get_value(h, 'naam')
                 if naam:
                     huurder_namen.append(naam)
                 if not first_huurder:
@@ -488,16 +568,16 @@ class ContractNormalizer:
 
         return {
             "verhuurder": {
-                "naam": self._safe_get(verhuurder, 'naam') or "",
-                "adres": self._safe_get(verhuurder, 'adres') or self._safe_get(verhuurder, 'zetel') or "",
-                "telefoon": self._safe_get(verhuurder, 'telefoon') or "",
-                "email": self._safe_get(verhuurder, 'email') or self._safe_get(verhuurder, 'e-mail') or ""
+                "naam": self._get_field_for_output(verhuurder, 'naam') or "",
+                "adres": self._get_field_for_output(verhuurder, 'adres') or self._get_field_for_output(verhuurder, 'zetel') or "",
+                "telefoon": self._get_field_for_output(verhuurder, 'telefoon') or "",
+                "email": self._get_field_for_output(verhuurder, 'email') or self._get_field_for_output(verhuurder, 'e-mail') or ""
             },
             "huurder": {
                 "naam": combined_naam or "",
-                "adres": self._safe_get(first_huurder, 'adres') or self._safe_get(first_huurder, 'woonplaats') or "",
-                "telefoon": self._safe_get(first_huurder, 'telefoon') or self._safe_get(first_huurder, 'gsm') or "",
-                "email": self._safe_get(first_huurder, 'email') or self._safe_get(first_huurder, 'e-mail') or ""
+                "adres": self._get_field_for_output(first_huurder, 'adres') or self._get_field_for_output(first_huurder, 'woonplaats') or "",
+                "telefoon": self._get_field_for_output(first_huurder, 'telefoon') or self._get_field_for_output(first_huurder, 'gsm') or "",
+                "email": self._get_field_for_output(first_huurder, 'email') or self._get_field_for_output(first_huurder, 'e-mail') or ""
             }
         }
 
@@ -507,7 +587,9 @@ class ContractNormalizer:
 
         # Extract address as simple string
         adres_raw = self._safe_get(pand, 'adres', default={})
-        if isinstance(adres_raw, dict):
+        if isinstance(adres_raw, dict) and "value" in adres_raw and not any(k not in ("value", "source_quote", "source_page") for k in adres_raw):
+            adres_str = str(adres_raw.get("value", ""))
+        elif isinstance(adres_raw, dict):
             volledig = self._safe_get(adres_raw, 'volledig_adres') or self._safe_get(adres_raw, 'volledig')
             if not volledig:
                 parts = []
@@ -528,33 +610,33 @@ class ContractNormalizer:
         epc_data = self._safe_get(pand, 'epc') or {}
         if isinstance(epc_data, str):
             epc_data = {"label": epc_data}
-        epc_geldig = self._normalize_date(self._safe_get(epc_data, 'geldig_tot'))
+        epc_geldig = self._normalize_date(self._safe_get_value(epc_data, 'geldig_tot'))
 
         # Kadaster
         kadaster = self._safe_get(pand, 'kadaster') or {}
         ki = self._extract_number(self._safe_get(kadaster, 'kadastraal_inkomen') or self._safe_get(kadaster, 'ki'))
 
         return {
-            "adres": adres_str,
-            "type": self._safe_get(pand, 'type') or self._safe_get(pand, 'type_woning') or "appartement",
-            "oppervlakte": self._extract_number(self._safe_get(pand, 'oppervlakte') or self._safe_get(pand, 'totale_bewoonbare_oppervlakte')),
-            "aantal_kamers": self._extract_number(self._safe_get(pand, 'aantal_kamers') or self._safe_get(pand, 'kamers')),
-            "verdieping": self._extract_number(self._safe_get(pand, 'verdieping')),
+            "adres": self._get_field_for_output(pand, 'adres') or adres_str,
+            "type": self._get_field_for_output(pand, 'type') or self._get_field_for_output(pand, 'type_woning') or "appartement",
+            "oppervlakte": self._extract_number(self._safe_get_value(pand, 'oppervlakte') or self._safe_get_value(pand, 'totale_bewoonbare_oppervlakte')),
+            "aantal_kamers": self._extract_number(self._safe_get_value(pand, 'aantal_kamers') or self._safe_get_value(pand, 'kamers')),
+            "verdieping": self._extract_number(self._safe_get_value(pand, 'verdieping')),
             "epc": {
-                "energielabel": self._safe_get(epc_data, 'energielabel') or self._safe_get(epc_data, 'label') or "",
-                "certificaatnummer": self._safe_get(epc_data, 'certificaatnummer') or self._safe_get(epc_data, 'nummer') or "",
+                "energielabel": self._get_field_for_output(epc_data, 'energielabel') or self._get_field_for_output(epc_data, 'label') or "",
+                "certificaatnummer": self._get_field_for_output(epc_data, 'certificaatnummer') or self._get_field_for_output(epc_data, 'nummer') or "",
                 "geldig_tot": epc_geldig,
-                "bewoonbare_oppervlakte_epc": self._extract_number(self._safe_get(epc_data, 'bewoonbare_oppervlakte_epc')),
-                "primair_energieverbruik": self._safe_get(epc_data, 'primair_energieverbruik'),
-                "referentiejaar": self._safe_get(epc_data, 'referentiejaar'),
+                "bewoonbare_oppervlakte_epc": self._extract_number(self._safe_get_value(epc_data, 'bewoonbare_oppervlakte_epc')),
+                "primair_energieverbruik": self._get_field_for_output(epc_data, 'primair_energieverbruik'),
+                "referentiejaar": self._get_field_for_output(epc_data, 'referentiejaar'),
             },
             "kadaster": {
-                "afdeling": self._safe_get(kadaster, 'afdeling') or "",
-                "sectie": self._safe_get(kadaster, 'sectie') or "",
-                "nummer": self._safe_get(kadaster, 'nummer') or self._safe_get(kadaster, 'perceelnummer') or "",
+                "afdeling": self._get_field_for_output(kadaster, 'afdeling') or "",
+                "sectie": self._get_field_for_output(kadaster, 'sectie') or "",
+                "nummer": self._get_field_for_output(kadaster, 'nummer') or self._get_field_for_output(kadaster, 'perceelnummer') or "",
                 "kadastraal_inkomen": ki,
-                "gemeente_kadaster": self._safe_get(kadaster, 'gemeente_kadaster') or "",
-                "grondnummer": self._safe_get(kadaster, 'grondnummer') or "",
+                "gemeente_kadaster": self._get_field_for_output(kadaster, 'gemeente_kadaster') or "",
+                "grondnummer": self._get_field_for_output(kadaster, 'grondnummer') or "",
             },
             "asbest": self._normalize_asbest_flat(self._safe_get(pand, 'asbest')),
         }
@@ -570,35 +652,40 @@ class ContractNormalizer:
                 "geldig_tot": None,
             }
         return {
-            "status": self._safe_get(asbest_data, 'status') or "",
-            "datum_attest": self._normalize_date(self._safe_get(asbest_data, 'datum_attest')),
-            "referentienummer": self._safe_get(asbest_data, 'referentienummer') or "",
-            "opmerking": self._safe_get(asbest_data, 'opmerking') or "",
-            "geldig_tot": self._normalize_date(self._safe_get(asbest_data, 'geldig_tot')),
+            "status": self._get_field_for_output(asbest_data, 'status') or "",
+            "datum_attest": self._normalize_date(self._safe_get_value(asbest_data, 'datum_attest')),
+            "referentienummer": self._get_field_for_output(asbest_data, 'referentienummer') or "",
+            "opmerking": self._get_field_for_output(asbest_data, 'opmerking') or "",
+            "geldig_tot": self._normalize_date(self._safe_get_value(asbest_data, 'geldig_tot')),
         }
 
     def _normalize_financieel_flat(self, data: dict) -> dict:
         """Returns flat financieel"""
         financieel = self._safe_get(data, 'financieel', default={})
 
-        # Huurprijs
-        huurprijs_raw = self._safe_get(financieel, 'huurprijs') or self._safe_get(financieel, 'maandelijkse_huurprijs')
-        if isinstance(huurprijs_raw, dict):
-            huurprijs_raw = self._safe_get(huurprijs_raw, 'bedrag')
-        huurprijs = self._extract_number(huurprijs_raw)
+        # Huurprijs (bewaar source_quote/source_page voor PDF-markering en UI)
+        huurprijs_raw = self._safe_get(financieel, 'huurprijs')
+        if isinstance(huurprijs_raw, dict) and 'bedrag' in huurprijs_raw:
+            huurprijs = self._number_field_for_output(huurprijs_raw, 'bedrag')
+        else:
+            huurprijs = self._number_field_for_output(financieel, 'huurprijs')
+        if huurprijs is None:
+            huurprijs = self._number_field_for_output(financieel, 'maandelijkse_huurprijs')
 
         # Waarborg
         waarborg_raw = self._safe_get(financieel, 'waarborg') or self._safe_get(financieel, 'huurwaarborg') or {}
         if isinstance(waarborg_raw, (int, float)):
             waarborg_raw = {"bedrag": waarborg_raw}
 
-        waarborg_bedrag = self._extract_number(self._safe_get(waarborg_raw, 'bedrag'))
+        waarborg_bedrag = self._number_field_for_output(waarborg_raw, 'bedrag')
+        if waarborg_bedrag is None:
+            waarborg_bedrag = self._extract_number(self._safe_get_value(waarborg_raw, 'bedrag'))
 
         # Build waar_gedeponeerd string
         waar_parts = []
-        bank = self._safe_get(waarborg_raw, 'bank_naam') or self._safe_get(waarborg_raw, 'bank')
-        iban = self._safe_get(waarborg_raw, 'iban')
-        waar_gedeponeerd_raw = self._safe_get(waarborg_raw, 'waar_gedeponeerd')
+        bank = self._safe_get_value(waarborg_raw, 'bank_naam') or self._safe_get_value(waarborg_raw, 'bank')
+        iban = self._safe_get_value(waarborg_raw, 'iban')
+        waar_gedeponeerd_raw = self._safe_get_value(waarborg_raw, 'waar_gedeponeerd')
 
         if waar_gedeponeerd_raw:
             waar_gedeponeerd = waar_gedeponeerd_raw
@@ -612,8 +699,8 @@ class ContractNormalizer:
             waar_gedeponeerd = ""
 
         # Kosten
-        kosten_raw = self._safe_get(financieel, 'kosten')
-        if kosten_raw:
+        kosten_raw = self._safe_get_value(financieel, 'kosten')
+        if kosten_raw is not None and kosten_raw != "":
             kosten = str(kosten_raw)
         else:
             gem_kosten = self._safe_get(financieel, 'gemeenschappelijke_kosten', default={})
@@ -636,15 +723,15 @@ class ContractNormalizer:
                 kosten = ""
 
         # Indexatie
-        indexatie = self._normalize_boolean(self._safe_get(financieel, 'indexatie') or self._safe_get(financieel, 'indexering'))
+        indexatie = self._normalize_boolean(self._safe_get_value(financieel, 'indexatie') or self._safe_get_value(financieel, 'indexering'))
 
         return {
             "huurprijs": huurprijs,
             "waarborg": {
                 "bedrag": waarborg_bedrag,
-                "waar_gedeponeerd": waar_gedeponeerd
+                "waar_gedeponeerd": self._get_field_for_output(waarborg_raw, 'waar_gedeponeerd') or waar_gedeponeerd
             },
-            "kosten": kosten,
+            "kosten": self._get_field_for_output(financieel, 'kosten') or kosten,
             "indexatie": indexatie
         }
 
@@ -653,17 +740,17 @@ class ContractNormalizer:
         periodes = self._safe_get(data, 'periodes', default={})
 
         ingangsdatum = self._normalize_date(
-            self._safe_get(periodes, 'ingangsdatum') or self._safe_get(periodes, 'aanvang') or self._safe_get(periodes, 'start')
+            self._safe_get_value(periodes, 'ingangsdatum') or self._safe_get_value(periodes, 'aanvang') or self._safe_get_value(periodes, 'start')
         )
         einddatum = self._normalize_date(
-            self._safe_get(periodes, 'einddatum') or self._safe_get(periodes, 'einde')
+            self._safe_get_value(periodes, 'einddatum') or self._safe_get_value(periodes, 'einde')
         )
 
-        duur = self._safe_get(periodes, 'duur') or self._safe_get(periodes, 'contract_type_duur') or self._safe_get(periodes, 'looptijd') or ""
+        duur = self._get_field_for_output(periodes, 'duur') or self._get_field_for_output(periodes, 'contract_type_duur') or self._get_field_for_output(periodes, 'looptijd') or ""
 
-        opzegtermijn_raw = self._safe_get(periodes, 'opzegtermijn')
-        opzegtermijn_huurder = self._safe_get(periodes, 'opzegtermijn_huurder')
-        opzegtermijn_verhuurder = self._safe_get(periodes, 'opzegtermijn_verhuurder')
+        opzegtermijn_raw = self._safe_get_value(periodes, 'opzegtermijn')
+        opzegtermijn_huurder = self._safe_get_value(periodes, 'opzegtermijn_huurder')
+        opzegtermijn_verhuurder = self._safe_get_value(periodes, 'opzegtermijn_verhuurder')
 
         if opzegtermijn_raw:
             opzegtermijn = str(opzegtermijn_raw)
@@ -679,21 +766,21 @@ class ContractNormalizer:
             "ingangsdatum": ingangsdatum,
             "einddatum": einddatum,
             "duur": duur,
-            "opzegtermijn": opzegtermijn
+            "opzegtermijn": self._get_field_for_output(periodes, 'opzegtermijn') or self._get_field_for_output(periodes, 'opzegtermijn_huurder') or self._get_field_for_output(periodes, 'opzegtermijn_verhuurder') or opzegtermijn
         }
 
     def _normalize_voorwaarden_flat(self, data: dict) -> dict:
         """Returns flat voorwaarden"""
         voorwaarden = self._safe_get(data, 'voorwaarden', default={})
 
-        huisdieren_raw = self._safe_get(voorwaarden, 'huisdieren')
+        huisdieren_raw = self._safe_get_value(voorwaarden, 'huisdieren')
         if isinstance(huisdieren_raw, dict):
-            huisdieren = self._normalize_boolean(self._safe_get(huisdieren_raw, 'toegestaan'))
+            huisdieren = self._normalize_boolean(self._safe_get_value(huisdieren_raw, 'toegestaan'))
         else:
             huisdieren = self._normalize_boolean(huisdieren_raw)
 
-        onderverhuur = self._normalize_boolean(self._safe_get(voorwaarden, 'onderverhuur'))
-        werken = self._safe_get(voorwaarden, 'werken') or ""
+        onderverhuur = self._normalize_boolean(self._safe_get_value(voorwaarden, 'onderverhuur'))
+        werken = self._get_field_for_output(voorwaarden, 'werken') or ""
 
         return {
             "huisdieren": huisdieren,
@@ -706,8 +793,8 @@ class ContractNormalizer:
         juridisch = self._safe_get(data, 'juridisch', default={})
 
         return {
-            "toepasselijk_recht": self._safe_get(juridisch, 'toepasselijk_recht') or "",
-            "bevoegde_rechtbank": self._safe_get(juridisch, 'bevoegde_rechtbank') or ""
+            "toepasselijk_recht": self._get_field_for_output(juridisch, 'toepasselijk_recht') or "",
+            "bevoegde_rechtbank": self._get_field_for_output(juridisch, 'bevoegde_rechtbank') or ""
         }
 
 
@@ -1001,13 +1088,22 @@ def is_api_key_error(error_msg):
     )
 
 
-def send_email(subject, body):
+def send_email(subject, body, image_path=None):
+    """
+    Verstuur e-mail met optionele PNG-bijlage.
+    image_path: pad naar een .png-bestand (bijv. logo); wordt als bijlage meegestuurd.
+    """
     try:
         msg = MIMEMultipart()
         msg['From'] = SENDER_EMAIL
         msg['To'] = ', '.join(RECIPIENT_EMAIL)
         msg['Subject'] = subject
         msg.attach(MIMEText(body, 'plain', 'utf-8'))
+        if image_path and os.path.isfile(image_path):
+            with open(image_path, 'rb') as f:
+                img = MIMEImage(f.read(), _subtype='png')
+            img.add_header('Content-Disposition', 'attachment', filename=os.path.basename(image_path))
+            msg.attach(img)
         with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
             server.starttls()
             server.login(SENDER_EMAIL, SENDER_PASSWORD)
@@ -1114,9 +1210,8 @@ def ensure_csv_exists(dbx_target):
         return True
     except dropbox.exceptions.ApiError as e:
         if e.error.is_path() and e.error.get_path().is_not_found():
-            header = 'timestamp,filename,document_type,confidence_score,needs_review,text_length,fields_complete,issues,warnings,json_path,processing_status\n'
             try:
-                dbx_target.files_upload(header.encode('utf-8'), CSV_LOG_PATH, mode=dropbox.files.WriteMode.overwrite)
+                dbx_target.files_upload(NEW_CSV_HEADER.encode('utf-8'), CSV_LOG_PATH, mode=dropbox.files.WriteMode.overwrite)
                 print("📊 CSV log created")
                 return True
             except Exception as ex:
@@ -1125,6 +1220,17 @@ def ensure_csv_exists(dbx_target):
         else:
             print(f"❌ CSV check error: {e}")
             return False
+
+
+def _csv_cell(v):
+    """One value for CSV; unwrap source objects to display value."""
+    if v is None or v == "":
+        return ""
+    if isinstance(v, dict) and "value" in v and not any(k not in ("value", "source_quote", "source_page") for k in v):
+        v = v.get("value")
+    if v is None or v == "":
+        return ""
+    return str(v).strip()
 
 
 def log_to_csv(dbx_target, filename, result, json_path, status="success"):
@@ -1140,15 +1246,47 @@ def log_to_csv(dbx_target, filename, result, json_path, status="success"):
             print(f"❌ CSV download error: {e}")
             return False
 
+        # Gebruik nieuw bestand (v2) als de bestaande CSV het oude format heeft (geen source_quote_pct kolom)
+        first_line = (current_csv.split('\n')[0] or '').strip()
+        if 'source_quote_pct' not in first_line:
+            csv_path = CSV_LOG_PATH_NEW
+            try:
+                _, response_v2 = dbx_target.files_download(csv_path)
+                current_csv = response_v2.content.decode('utf-8')
+            except Exception:
+                print("📊 Bestaande CSV heeft oud format → log naar " + csv_path)
+                current_csv = NEW_CSV_HEADER
+        else:
+            csv_path = CSV_LOG_PATH
+
         conf = result.get('confidence', {})
+        metrics = conf.get('metrics', {})
+        nd = result.get('normalized_data', {})
+        financieel = nd.get('financieel') or {}
+        partijen = nd.get('partijen') or {}
+        pand = nd.get('pand') or {}
+        periodes = nd.get('periodes') or {}
+        verhuurder = partijen.get('verhuurder') or {}
+        huurder = partijen.get('huurder') or {}
+        if isinstance(huurder, list) and huurder:
+            huurder = huurder[0] if isinstance(huurder[0], dict) else {}
+        elif not isinstance(huurder, dict):
+            huurder = {}
+
         new_row = [
             datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             filename,
             result.get('title', 'Unknown'),
             str(conf.get('score', 0)),
             'Yes' if conf.get('needs_review', True) else 'No',
-            str(conf.get('metrics', {}).get('text_length', 0)),
-            f"{conf.get('metrics', {}).get('completeness', 0):.0%}",
+            str(metrics.get('text_length', 0)),
+            f"{metrics.get('completeness', 0):.0%}",
+            f"{metrics.get('source_quote_pct', 0):.0%}",
+            _csv_cell(financieel.get('huurprijs')),
+            _csv_cell(pand.get('adres')),
+            _csv_cell(periodes.get('ingangsdatum')),
+            _csv_cell(verhuurder.get('naam')),
+            _csv_cell(huurder.get('naam')),
             '; '.join(conf.get('issues', [])) or 'None',
             '; '.join(conf.get('warnings', [])) or 'None',
             json_path or '',
@@ -1156,8 +1294,8 @@ def log_to_csv(dbx_target, filename, result, json_path, status="success"):
         ]
         new_row = [f'"{str(field).replace('"', '""')}"' for field in new_row]
         new_line = ','.join(new_row) + '\n'
-        updated_csv = current_csv + new_line
-        dbx_target.files_upload(updated_csv.encode('utf-8'), CSV_LOG_PATH, mode=dropbox.files.WriteMode.overwrite)
+        updated_csv = current_csv.rstrip('\n') + '\n' + new_line
+        dbx_target.files_upload(updated_csv.encode('utf-8'), csv_path, mode=dropbox.files.WriteMode.overwrite)
         return True
     except Exception as e:
         print(f"❌ CSV logging error: {e}")
@@ -1257,7 +1395,7 @@ def init_clients():
 
         # Supabase via REST API (geen pip-pakket: lokale map supabase/ zou die overschaduwen)
         _url = (os.getenv('SUPABASE_URL') or os.getenv('NEXT_PUBLIC_SUPABASE_URL') or SUPABASE_URL or '').strip().rstrip('/')
-        _key = (os.getenv('SUPABASE_SERVICE_KEY') or os.getenv('SUPABASE_SERVICE_ROLE_KEY') or SUPABASE_SERVICE_KEY or '').strip()
+        _key = (os.getenv('SUPABASE_SERVICE_ROLE_KEY') or os.getenv('SUPABASE_SERVICE_KEY') or SUPABASE_SERVICE_KEY or '').strip()
         if not _url or not _key:
             raise RuntimeError("SUPABASE_URL en SUPABASE_SERVICE_KEY (of NEXT_PUBLIC_SUPABASE_URL en SUPABASE_SERVICE_ROLE_KEY) ontbreken in .env.local. Zet ze in Supabase Dashboard → Settings → API.")
         try:
@@ -1363,16 +1501,18 @@ def extract_text_google_vision(image_data: List[bytes], api_key: str) -> str:
         return ""
 
 
-def extract_text_with_ocr(pdf_bytes: bytes, gemini_client, model: str, 
-                          initial_pages: int = INITIAL_PAGES_TO_SCAN) -> Tuple[str, dict]:
-    """Extract text from PDF with OCR fallback for scanned documents"""
+def extract_text_with_ocr(pdf_bytes: bytes, gemini_client, model: str,
+                          initial_pages: int = INITIAL_PAGES_TO_SCAN,
+                          extract_key_idx: Optional[int] = None) -> Tuple[str, dict, List[Tuple[int, str]]]:
+    """Extract text from PDF with OCR fallback for scanned documents. Returns (cleaned_text, metadata, pages_text)."""
     try:
         full_text = ""
         total_pages = 0
         pages_scanned = 0
         extraction_method = "text"
 
-        # Phase 1: Try normal text extraction
+        # Phase 1: Try normal text extraction (per-page for source_quote highlighting)
+        pages_text = []  # list of (1-based page number, page text)
         with io.BytesIO(pdf_bytes) as pdf_file:
             with pdfplumber.open(pdf_file) as pdf:
                 total_pages = len(pdf.pages)
@@ -1382,6 +1522,7 @@ def extract_text_with_ocr(pdf_bytes: bytes, gemini_client, model: str,
                     try:
                         page_text = pdf.pages[i].extract_text() or ""
                         full_text += page_text + "\n"
+                        pages_text.append((i + 1, page_text))
                         pages_scanned += 1
                     except Exception:
                         continue
@@ -1424,7 +1565,7 @@ def extract_text_with_ocr(pdf_bytes: bytes, gemini_client, model: str,
                     else:
                         ocr_text = ""
                 if not ocr_text and gemini_client and model:
-                    ocr_text = extract_text_vision(image_data, gemini_client, model)
+                    ocr_text = extract_text_vision(image_data, gemini_client, model, key_idx=extract_key_idx)
                     if ocr_text and len(ocr_text) > 100:
                         cleaned_text = ocr_text
                         extraction_method = "ocr_vision"
@@ -1454,6 +1595,7 @@ def extract_text_with_ocr(pdf_bytes: bytes, gemini_client, model: str,
                         try:
                             page_text = pdf.pages[i].extract_text() or ""
                             full_text += page_text + "\n"
+                            pages_text.append((i + 1, page_text))
                             pages_scanned += 1
 
                             if i % 3 == 0:
@@ -1465,6 +1607,9 @@ def extract_text_with_ocr(pdf_bytes: bytes, gemini_client, model: str,
 
             cleaned_text = ' '.join(full_text.split())
 
+        if not pages_text and cleaned_text:
+            pages_text = [(1, cleaned_text)]
+
         metadata = {
             'total_pages': total_pages,
             'pages_scanned': pages_scanned,
@@ -1472,18 +1617,18 @@ def extract_text_with_ocr(pdf_bytes: bytes, gemini_client, model: str,
             'extraction_method': extraction_method,
             'ocr_engine': extraction_method if extraction_method in ("ocr_google_vision", "ocr_vision") else "text_layer",
         }
-        return cleaned_text, metadata
+        if extraction_method != "text" and cleaned_text:
+            pages_text = [(1, cleaned_text)]
+        return cleaned_text, metadata, pages_text
 
     except Exception as e:
         logger.error(f"⚠️  Extraction error: {e}", exc_info=True)
-        return "", {'error': str(e)}
-def extract_text_vision(images: List[bytes], gemini_client, model) -> str:
+        return "", {'error': str(e)}, []
+def extract_text_vision(images: List[bytes], gemini_client, model, key_idx: Optional[int] = None) -> str:
     """Extract text from images with Gemini Vision API"""
     try:
-        prompt = "Extract ALL text from these images. Include handwritten text if present. Return ONLY the extracted text, no explanations."
-
         # ✅ FIXED: Just use string directly, not wrapped in Part
-        parts = [prompt]
+        parts = [PROMPT_OCR_VISION]
 
         for img_bytes in images:
             parts.append(types.Part.from_bytes(
@@ -1497,6 +1642,8 @@ def extract_text_vision(images: List[bytes], gemini_client, model) -> str:
                     model=model,
                     contents=parts
                 )
+                if key_idx is not None:
+                    record_extract_use(key_idx)
                 return response.text
 
             except Exception as e:
@@ -1606,125 +1753,15 @@ def smart_classify(text: str, filename: str, current_location: str,
     extraction_method = pdf_metadata.get('extraction_method', 'text')
     method_note = " (OCR used)" if extraction_method == "ocr" else ""
 
-    prompt = f"""SYSTEM: Je bent een EXPERT documentclassificeerder. Je doet TWEE dingen in één antwoord:
-1) LEES het document en maak een KORTE samenvatting (max 3-4 zinnen; voor metadata).
-2) BEPAAL het type document en de mapstructuur (waar het in Dropbox moet).
-
-CRITICAL: /Onbekend_adres is ALLEEN voor CONTRACTEN (huur, EPC, eigendomstitel, …) waar het adres niet uit de tekst komt. Verhalen, essays, onderwijs, facturen → NOOIT /Onbekend_adres. Verhaal/essay/narratief → ALTIJD /Verhaal.
-
-FILENAME: {filename}
-LOCATION: {current_location}
-EXTRACTION: {pdf_metadata.get('pages_scanned', '?')}/{pdf_metadata.get('total_pages', '?')} pages{method_note}
-
-EXISTING FOLDERS (bestaande mappen; kijk of jouw folder_path hier al in voorkomt → action "existing", anders "new"):
-{existing_folders if existing_folders else "Geen mappen nog - eerste document."}
-
-DOCUMENT TEKST (volledig inlezen voor samenvatting; gebruik ook voor classificatie):
-{text_for_call}
-
-═══════════════════════════════════════════════════════════════════
-REGELS
-═══════════════════════════════════════════════════════════════════
-
-1. BEPAAL HET TYPE DOCUMENT (uit inhoud, niet uit bestandsnaam):
-   - Huurcontract / huurovereenkomst → CONTRACT, type Huurcontracten
-   - EPC / energieprestatiecertificaat / energiedocument → CONTRACT, type EPC
-   - Asbestattest / asbestinventaris / asbestvrijverklaring → CONTRACT, type Asbest
-   - Eigendomstitel / akte → CONTRACT, type Eigendomstitel
-   - Koopcontract / verkoopovereenkomst → CONTRACT, type Koopcontracten
-   - Verhaal, essay, persoonlijke tekst, narratief, kort verhaal → NIET CONTRACT → folder_path = /Verhaal (NOOIT /Onbekend_adres)
-   - Certificaat, verklaring, studentenverklaring, bewijs van deelname → NIET CONTRACT → folder_path = /Onderwijs (NOOIT /Onbekend_adres)
-   - Onderwijs, college, cursus, studie, dictaat → NIET CONTRACT → map /Onderwijs (eventueel /Onderwijs/Subcategorie)
-   - Factuur, offerte, betalingsdocument → NIET CONTRACT → map /Facturen
-   - Overige zakelijke documenten → map die past bij inhoud (bv. /Correspondentie, /Rapporten)
-   - Twijfel of onduidelijk → /Overig
-
-2. CONTRACTEN (huur, EPC, asbest, eigendomstitel, koop, …):
-   - folder_path = /Contracten/[TypeMap]/[Adres]
-   - TypeMap = Huurcontracten, EPC, Asbest, Eigendomstitel, Koopcontracten.
-   - Adres = straat + nummer uit de tekst (bv. Kerkstraat_10, Meir_78_bus_3). Alleen bij CONTRACTEN: als geen adres in tekst → Onbekend_adres.
-   - Zelfde adres + zelfde type: als die map al in EXISTING FOLDERS staat → action "existing", anders "new".
-   - suggested_filename = Adres_Type.pdf (bv. Kerkstraat_10_huurcontract.pdf, Meir_78_bus_3_EPC.pdf, Kerkstraat_10_asbest.pdf).
-   Voorbeelden: /Contracten/Huurcontracten/Kerkstraat_10, /Contracten/EPC/Meir_78_bus_3, /Contracten/Asbest/Kerkstraat_10, /Contracten/Eigendomstitel/Onbekend_adres.
-
-3. NIET-CONTRACTEN (verhaal, certificaat, verklaring, onderwijs, factuur, …):
-   - Verhaal/essay/narratief → folder_path = /Verhaal. Certificaat/verklaring/studentenverklaring → folder_path = /Onderwijs. NOOIT /Onbekend_adres.
-   - Onderwijs → /Onderwijs of /Onderwijs/Sub. Factuur → /Facturen. Overig → /Teksten, /Overig, etc.
-   - Geen adres in het pad. suggested_filename = korte beschrijvende naam (letters, cijfers, underscores), eindig op .pdf.
-
-4. ACTION:
-   - "existing" = folder_path staat al in EXISTING FOLDERS (zelfde pad gebruiken).
-   - "new" = folder_path bestaat nog niet, wordt aangemaakt.
-
-VERPLICHT: Geef ALTIJD action, folder_path, confidence (0-100), reasoning, suggested_filename, EN summary.
-- folder_path altijd met leading slash, delen gescheiden door /, geen spaties in mapnamen (gebruik underscore).
-- suggested_filename: alleen letters, cijfers, underscores; eindig op .pdf.
-- summary: korte samenvatting van het document (max 3-4 zinnen), gebaseerd op de volledige tekst hierboven.
-
-ANTWOORD FORMAT (ALLEEN JSON, geen tekst ervoor/erna):
-
-Voorbeeld CONTRACT (huurcontract Kerkstraat 10, map bestaat al):
-{{
-  "action": "existing",
-  "folder_path": "/Contracten/Huurcontracten/Kerkstraat_10",
-  "confidence": 95,
-  "reasoning": "Huurcontract voor Kerkstraat 10; map /Contracten/Huurcontracten/Kerkstraat_10 bestaat al.",
-  "suggested_filename": "Kerkstraat_10_huurcontract.pdf",
-  "summary": "Huurcontract tussen verhuurder X en huurder Y voor Kerkstraat 10. Looptijd 3 jaar, huurprijs 850 euro. Waarborg twee maanden."
-}}
-
-Voorbeeld CONTRACT (EPC Meir 78 bus 3, nieuwe map):
-{{
-  "action": "new",
-  "folder_path": "/Contracten/EPC/Meir_78_bus_3",
-  "confidence": 98,
-  "reasoning": "Energieprestatiecertificaat voor Meir 78 bus 3; map bestaat nog niet.",
-  "suggested_filename": "Meir_78_bus_3_EPC.pdf",
-  "summary": "EPC voor Meir 78 bus 3. Energielabel C. Bewoonbare oppervlakte 95 m². Geldig tot 2030."
-}}
-
-Voorbeeld CONTRACT (Asbestattest Kerkstraat 10):
-{{
-  "action": "new",
-  "folder_path": "/Contracten/Asbest/Kerkstraat_10",
-  "confidence": 95,
-  "reasoning": "Asbestattest / asbestvrijverklaring voor Kerkstraat 10.",
-  "suggested_filename": "Kerkstraat_10_asbest.pdf",
-  "summary": "Asbestattest voor Kerkstraat 10. Pand asbestvrij verklaard. Datum attest vermeld."
-}}
-
-Voorbeeld NIET-CONTRACT (verhaal) — ALTIJD /Verhaal, NOOIT /Onbekend_adres:
-{{
-  "action": "new",
-  "folder_path": "/Verhaal",
-  "confidence": 90,
-  "reasoning": "Verhaal/essay/narratief, geen contract; hoort in map Verhaal. Onbekend_adres is alleen voor contracten zonder adres.",
-  "suggested_filename": "verhaal_document.pdf",
-  "summary": "Persoonlijk verhaal over een reis. Geen contract of officieel document."
-}}
-FOUT: verhaal of certificaat in /Onbekend_adres plaatsen. Onbekend_adres = ALLEEN voor contracten (huur, EPC, …) waar het adres ontbreekt.
-
-Voorbeeld NIET-CONTRACT (certificaat/verklaring) — ALTIJD /Onderwijs, NOOIT /Onbekend_adres:
-{{
-  "action": "existing",
-  "folder_path": "/Onderwijs",
-  "confidence": 95,
-  "reasoning": "Certificaat van deelname / studentenverklaring; geen contract. Hoort in /Onderwijs.",
-  "suggested_filename": "certificaat_verklaring.pdf",
-  "summary": "Certificaat van deelname aan een cursus. Geen contract."
-}}
-
-Voorbeeld NIET-CONTRACT (onderwijs):
-{{
-  "action": "existing",
-  "folder_path": "/Onderwijs/Bedrijfskunde",
-  "confidence": 92,
-  "reasoning": "Onderwijsmateriaal bedrijfskunde; map bestaat al.",
-  "suggested_filename": "college_week3.pdf",
-  "summary": "College-notities bedrijfskunde week 3. Geen contract."
-}}
-
-JSON:"""
+    prompt = PROMPT_ORGANIZE.format(
+        filename=filename,
+        current_location=current_location,
+        pages_scanned=pdf_metadata.get('pages_scanned', '?'),
+        total_pages=pdf_metadata.get('total_pages', '?'),
+        method_note=method_note,
+        existing_folders=existing_folders if existing_folders else "Geen mappen nog - eerste document.",
+        text_for_call=text_for_call,
+    )
 
     for attempt in range(MAX_RETRIES):
         try:
@@ -1734,6 +1771,7 @@ JSON:"""
                 config=types.GenerateContentConfig(
                     temperature=0.1,
                     response_mime_type="application/json",
+                    max_output_tokens=4096,
                 ),
             )
 
@@ -1851,6 +1889,9 @@ def organize_batch(clients, folder_mgr, organized_history, max_docs=BATCH_SIZE):
         print(f"\n📦 Processing batch of {len(batch)} document(s)")
 
         for i, pdf_info in enumerate(batch, 1):
+            if _shutdown_requested[0]:
+                print("\n⏹️  Stop aangevraagd - batch afgebroken.")
+                break
             try:
                 print(f"\n{'='*70}")
                 print(f"📄 [{i}/{len(batch)}] {pdf_info['name']}")
@@ -1873,7 +1914,7 @@ def organize_batch(clients, folder_mgr, organized_history, max_docs=BATCH_SIZE):
                 _, response = dbx.files_download(pdf_info['path'])
 
                 # Extract text
-                text, pdf_metadata = extract_text_with_ocr(response.content, gemini, model)
+                text, pdf_metadata, _ = extract_text_with_ocr(response.content, gemini, model)
 
                 if not text or len(text) < MIN_TEXT_FOR_PROCESSING:
                     logger.warning(f"⚠️  Insufficient text ({len(text)} chars) - skipping")
@@ -2150,9 +2191,50 @@ def try_regex_contract_fields(full_text: str) -> Dict[str, dict]:
     return out
 
 
-def extract_contract_data(full_text, gemini_client, model, initial_data: Optional[Dict[str, dict]] = None):
+def _unwrap_field_value(v: Any) -> Any:
+    """Get display value from a field that may be {value, source_quote, source_page} or a plain string."""
+    if isinstance(v, dict) and "value" in v:
+        return v.get("value")
+    return v
+
+
+def _add_source_pages(data: Any, pages_text: List[Tuple[int, str]]) -> None:
+    """Recursively add source_page to every dict that has source_quote by searching per-page text."""
+    if not pages_text:
+        return
+
+    def normalize_ws(s: str) -> str:
+        return " ".join((s or "").split()).strip()
+
+    def find_page(quote: str) -> Optional[int]:
+        if not quote or not quote.strip():
+            return None
+        q = normalize_ws(quote)
+        if not q:
+            return None
+        for page_num, page_content in pages_text:
+            if normalize_ws(page_content).find(q) >= 0:
+                return page_num
+        if len(q) > 20:
+            for page_num, page_content in pages_text:
+                if q[:20] in normalize_ws(page_content) or q[-20:] in normalize_ws(page_content):
+                    return page_num
+        return None
+
+    if isinstance(data, dict):
+        if "source_quote" in data and "source_page" not in data:
+            data["source_page"] = find_page(str(data.get("source_quote", "")))
+        for child in data.values():
+            _add_source_pages(child, pages_text)
+    elif isinstance(data, list):
+        for item in data:
+            _add_source_pages(item, pages_text)
+
+
+def extract_contract_data(full_text, gemini_client, model, initial_data: Optional[Dict[str, dict]] = None, pages_text: Optional[List[Tuple[int, str]]] = None, extract_key_idx: Optional[int] = None):
     """
     Multi-stage huurcontract extractor. Stap 4+5: eerst regels (initial_data), dan AI voor ontbrekende secties.
+    pages_text: optional list of (1-based page number, page text) for adding source_page to source_quote fields.
     """
     if initial_data is None:
         initial_data = try_regex_contract_fields(full_text)
@@ -2167,326 +2249,17 @@ def extract_contract_data(full_text, gemini_client, model, initial_data: Optiona
 
     extracted_sections = {}
 
-    # ========================================================================
-    # STAGE 1: PARTIJEN (Verhuurder + Huurder)
-    # ========================================================================
+    _sq = SOURCE_QUOTE_INSTRUCTION
+    _ctx2_6k = text_chunk_2[:6000] if text_chunk_2 else ""
+    _ctx2_5k = text_chunk_2[:5000] if text_chunk_2 else ""
 
-    partijen_prompt = f"""Je bent een expert in Belgische huurcontracten. 
-
-TAAK: Extraheer ALLE informatie over verhuurder(s) en huurder(s).
-
-ZOEK SPECIFIEK NAAR:
-- Volledige namen (voor + achternaam, of bedrijfsnaam)
-- Adressen (straat + nummer + bus + postcode + stad)
-- Telefoonnummers (vast + GSM)
-- Email adressen
-- BTW nummers (voor bedrijven)
-- Rijksregisternummers
-
-BELANGRIJK:
-- Als er MEERDERE huurders zijn → combineer namen met " & "
-- Als adres NIET vermeld → gebruik "ONTBREKEND"
-- Als telefoon NIET vermeld → gebruik "ONTBREKEND"
-- Kopieer exacte spelling uit contract
-
-CONTRACT TEKST:
-{text_chunk_1}
-
-VOORBEELD OUTPUT (volg deze structuur EXACT):
-{{
-  "verhuurder": {{
-    "naam": "Vastgoed Beheer NV",
-    "adres": "Industrielaan 5, 9000 Gent",
-    "telefoon": "+32 9 123 45 67",
-    "email": "info@vastgoedbeheer.be"
-  }},
-  "huurder": {{
-    "naam": "Marie Dupont & Peter Vermeulen",
-    "adres": "Voorlopig adres: Kerkstraat 5, 1000 Brussel",
-    "telefoon": "+32 2 987 65 43",
-    "email": "marie.dupont@email.be"
-  }}
-}}
-
-ALLEEN JSON (geen tekst ervoor/erna):"""
-
-    # ========================================================================
-    # STAGE 2: PAND (Adres + Kenmerken + EPC + Kadaster + Asbest + Overzicht)
-    # ========================================================================
-    # Gedetailleerde extractie zodat Huizen-tab optimaal kan zoeken op EPC, kadastraal, asbest en overzicht.
-
-    pand_prompt = f"""Je bent een expert in Belgische huurcontracten en vastgoeddocumenten.
-
-TAAK: Extraheer ALLE informatie over het gehuurde pand. Deze data wordt gebruikt voor zoeken en overzicht (EPC, kadastraal, asbest, pandoverzicht). Wees zo volledig en precies mogelijk.
-
-══════════════════════════════════════════════════════════════════════════════
-1. ADRES EN WOONKENMERKEN
-══════════════════════════════════════════════════════════════════════════════
-- Volledig adres: straat, nummer, bus, postcode, stad (exact zoals in document)
-- Type woning: appartement, huis, studio, duplex, enz.
-- Bewoonbare oppervlakte in m² (alleen getal, geen "m²")
-- Aantal kamers / slaapkamers
-- Verdieping (getal of "gelijkvloers", "kelder")
-- Eventueel: bouwjaar, staat van het pand
-
-══════════════════════════════════════════════════════════════════════════════
-2. EPC (Energieprestatiecertificaat) — VOLLEDIG UITLEZEN
-══════════════════════════════════════════════════════════════════════════════
-- energielabel: exacte letter/klasse (A++, A+, A, B, C, D, E, F, G)
-- certificaatnummer: volledig nummer (bv. 20231205-0001234-00000001 of formaat op het attest)
-- geldig_tot: einddatum geldigheid EPC (formaat YYYY-MM-DD); als alleen jaar → YYYY-12-31
-- bewoonbare_oppervlakte_epc: oppervlakte in m² zoals op EPC vermeld (getal)
-- primair_energieverbruik: indien vermeld (kWh/m² jaar of totaal)
-- referentiejaar: indien vermeld op EPC
-Als EPC niet in de tekst staat → gebruik "ONTBREKEND" per veld.
-
-══════════════════════════════════════════════════════════════════════════════
-3. KADASTER — VOLLEDIG UITLEZEN
-══════════════════════════════════════════════════════════════════════════════
-- afdeling: kadastrale afdeling (bv. "Brussel 1e afdeling", "Antwerpen 2e afdeling")
-- sectie: kadastrale sectie (letter of code)
-- nummer: perceelnummer / lotnummer (bv. "123/4B", "456", "789/C")
-- kadastraal_inkomen: bedrag in euro (alleen getal)
-- gemeente_kadaster: gemeente volgens kadaster indien anders dan adres
-- grondnummer: indien vermeld
-Kadastraal inkomen = KI; zoek ook naar "kadastraal inkomen", "KI", "indexcijfer". Als niet vermeld → "ONTBREKEND" of null.
-
-══════════════════════════════════════════════════════════════════════════════
-4. ASBEST (Asbestattest / asbestinventaris) — VOLLEDIG UITLEZEN
-══════════════════════════════════════════════════════════════════════════════
-- status: "asbestvrij" / "bevat_geen_asbest" / "bevat_asbest" / "niet_onderzocht" / "ONTBREKEND"
-- datum_attest: datum van het asbestattest (YYYY-MM-DD)
-- referentienummer: referentie- of attestnummer indien vermeld
-- opmerking: korte opmerking indien van toepassing (bv. "asbestvrij verklaard na verwijdering")
-- geldig_tot: indien geldigheidsduur vermeld
-Zoek naar: asbestattest, asbestinventaris, asbestvrij, asbestvrijverklaring, bevat geen asbest, asbest bevat. Als geen asbestinfo in document → status "ONTBREKEND", rest leeg of null.
-
-══════════════════════════════════════════════════════════════════════════════
-5. OVERZICHT
-══════════════════════════════════════════════════════════════════════════════
-Deze velden samen vormen het "overzicht" per pand. Vul elk veld in dat je in de tekst vindt; gebruik "ONTBREKEND" of null alleen als het echt ontbreekt. Geen veld weglaten in de JSON-structuur.
-
-BELANGRIJK (altijd toepassen):
-- Oppervlakte = alleen het getal (geen "m²", geen eenheid). Ook bewoonbare_oppervlakte_epc = getal.
-- Kadastraal inkomen = bedrag in euro, alleen het getal (geen €, geen eenheid).
-- Als iets NIET in de tekst vermeld staat → gebruik "ONTBREKEND" (string) of null voor optionele velden.
-- Kopieer exacte adressen zoals in het contract (geen afkortingen tenzij zo in document).
-
-CONTRACT TEKST:
-{text_chunk_1}
-
-Extra context (voor EPC/kadaster/asbest die later in document staan):
-{text_chunk_2[:6000] if text_chunk_2 else ""}
-
-VOORBEELD OUTPUT (volg deze structuur; alle sleutels aanwezig, ontbrekende waarden "ONTBREKEND" of null):
-{{
-  "adres": "Kerkstraat 10 bus 3, 1000 Brussel",
-  "type": "appartement",
-  "oppervlakte": 85.5,
-  "aantal_kamers": 3,
-  "verdieping": 2,
-  "epc": {{
-    "energielabel": "B",
-    "certificaatnummer": "20231205-0001234-00000001",
-    "geldig_tot": "2030-12-31",
-    "bewoonbare_oppervlakte_epc": 85,
-    "primair_energieverbruik": null,
-    "referentiejaar": null
-  }},
-  "kadaster": {{
-    "afdeling": "Brussel 1e afdeling",
-    "sectie": "A",
-    "nummer": "123/4B",
-    "kadastraal_inkomen": 1234.56,
-    "gemeente_kadaster": null,
-    "grondnummer": null
-  }},
-  "asbest": {{
-    "status": "asbestvrij",
-    "datum_attest": "2024-06-15",
-    "referentienummer": "ATT-2024-12345",
-    "opmerking": null,
-    "geldig_tot": null
-  }}
-}}
-
-ALLEEN JSON (geen tekst ervoor of erna):"""
-
-    # ========================================================================
-    # STAGE 3: FINANCIEEL (Huur + Waarborg + Kosten + Indexatie)
-    # ========================================================================
-
-    financieel_prompt = f"""Je bent een expert in Belgische huurcontracten.
-
-TAAK: Extraheer ALLE financiële informatie.
-
-ZOEK SPECIFIEK NAAR:
-- Maandelijkse huurprijs (bedrag in euro)
-- Waarborg/huurwaarborg bedrag
-- Bank waar waarborg gedeponeerd is (naam + IBAN rekening)
-- Gemeenschappelijke kosten (wat is inbegrepen)
-- Privélasten (energie, water, gas, internet)
-- Indexatie (ja/nee)
-
-BELANGRIJK:
-- Huurprijs = alleen het getal (geen € teken)
-- Waarborg bedrag = alleen het getal
-- waar_gedeponeerd = "Banknaam (rekening BE12 3456 7890 1234)"
-- kosten = beschrijving in tekst (wat inbegrepen, wat apart)
-- indexatie = true/false
-
-CONTRACT TEKST:
-{text_chunk_1}
-
-Extra context:
-{text_chunk_2[:5000] if text_chunk_2 else ""}
-
-VOORBEELD OUTPUT:
-{{
-  "huurprijs": 1150.0,
-  "waarborg": {{
-    "bedrag": 3450.0,
-    "waar_gedeponeerd": "Belfius Bank (rekening BE71 0961 2345 6769)"
-  }},
-  "kosten": "Gemeenschappelijke kosten (verwarming, water, lift) zijn inbegrepen in de huurprijs. Privélasten (elektriciteit, gas, internet) zijn voor rekening van huurder.",
-  "indexatie": true,
-  "gemeenschappelijke_kosten": {{
-    "inbegrepen": [
-      {{"post": "Verwarming"}},
-      {{"post": "Water"}},
-      {{"post": "Lift"}},
-      {{"post": "Gemeenschappelijke delen"}}
-    ]
-  }}
-}}
-
-ALLEEN JSON:"""
-
-    # ========================================================================
-    # STAGE 4: PERIODES (Data + Duur + Opzegtermijnen)
-    # ========================================================================
-
-    periodes_prompt = f"""Je bent een expert in Belgische huurcontracten.
-
-TAAK: Extraheer ALLE informatie over periodes en termijnen.
-
-ZOEK SPECIFIEK NAAR:
-- Ingangsdatum / aanvangsdatum (datum wanneer huur start)
-- Einddatum (als contract bepaalde duur heeft)
-- Duur van het contract (bijv. "9 jaar", "3 jaar", "onbepaalde duur")
-- Opzegtermijn voor huurder (hoeveel maanden)
-- Opzegtermijn voor verhuurder (hoeveel maanden)
-- Eventuele verlengingsvoorwaarden
-
-BELANGRIJK:
-- Datums in formaat YYYY-MM-DD (bijv. "2025-05-01")
-- Als geen einddatum → "ONTBREKEND"
-- Opzegtermijnen apart voor huurder en verhuurder
-- Duur = letterlijk zoals in contract staat
-
-CONTRACT TEKST:
-{text_chunk_1}
-
-Extra context:
-{text_chunk_2[:5000] if text_chunk_2 else ""}
-
-VOORBEELD OUTPUT:
-{{
-  "ingangsdatum": "2025-05-01",
-  "einddatum": "ONTBREKEND",
-  "duur": "9 jaar",
-  "opzegtermijn_huurder": "3 maanden",
-  "opzegtermijn_verhuurder": "6 maanden"
-}}
-
-ALLEEN JSON:"""
-
-    # ========================================================================
-    # STAGE 5: VOORWAARDEN (Huisdieren + Onderverhuur + Werken)
-    # ========================================================================
-
-    voorwaarden_prompt = f"""Je bent een expert in Belgische huurcontracten.
-
-TAAK: Extraheer ALLE bijzondere voorwaarden en bepalingen.
-
-ZOEK SPECIFIEK NAAR:
-- Huisdieren toegestaan? (ja/nee/met toestemming)
-- Onderverhuur toegestaan? (ja/nee)
-- Werken/verbouwingen (wat mag/niet mag)
-- Andere bijzondere bepalingen
-
-BELANGRIJK:
-- huisdieren = true/false/"ONTBREKEND"
-- onderverhuur = true/false
-- werken = beschrijving in tekst
-
-CONTRACT TEKST:
-{text_chunk_1}
-
-Extra context:
-{text_chunk_2[:5000] if text_chunk_2 else ""}
-
-VOORBEELD OUTPUT:
-{{
-  "huisdieren": true,
-  "onderverhuur": false,
-  "werken": "Kleine herstellingswerken toegestaan. Grotere verbouwingen enkel met schriftelijke toestemming van verhuurder."
-}}
-
-ALLEEN JSON:"""
-
-    # ========================================================================
-    # STAGE 6: JURIDISCH (Recht + Rechtbank)
-    # ========================================================================
-
-    juridisch_prompt = f"""Je bent een expert in Belgische huurcontracten.
-
-TAAK: Extraheer juridische bepalingen.
-
-ZOEK SPECIFIEK NAAR:
-- Toepasselijk recht (bijv. "Vlaams Woninghuurdecreet")
-- Bevoegde rechtbank / vrederechter (bijv. "Vrederechter van het kanton Gent")
-
-CONTRACT TEKST:
-{text_chunk_1}
-
-Extra context:
-{text_chunk_2[:5000] if text_chunk_2 else ""}
-
-VOORBEELD OUTPUT:
-{{
-  "toepasselijk_recht": "Vlaams Woninghuurdecreet van 9 november 2018",
-  "bevoegde_rechtbank": "Vrederechter van het kanton Brussel"
-}}
-
-ALLEEN JSON:"""
-
-    # ========================================================================
-    # STAGE 7: CONTRACT METADATA (Type + Datum)
-    # ========================================================================
-
-    metadata_prompt = f"""Je bent een expert in Belgische huurcontracten.
-
-TAAK: Extraheer algemene contract informatie.
-
-ZOEK SPECIFIEK NAAR:
-- Type contract (huurovereenkomst/huurcontract)
-- Datum van ondertekening contract
-
-CONTRACT TEKST:
-{text_chunk_1[:5000]}
-
-VOORBEELD OUTPUT:
-{{
-  "contract_type": "huurovereenkomst",
-  "datum_contract": "2025-03-18"
-}}
-
-ALLEEN JSON:"""
-
-    # ========================================================================
-    # EXECUTE ALL STAGES
-    # ========================================================================
+    partijen_prompt = PROMPT_PARTIJEN.format(text_chunk_1=text_chunk_1, source_quote_instruction=_sq)
+    pand_prompt = PROMPT_PAND.format(text_chunk_1=text_chunk_1, text_chunk_2=_ctx2_6k, source_quote_instruction=_sq)
+    financieel_prompt = PROMPT_FINANCIEEL.format(text_chunk_1=text_chunk_1, text_chunk_2=_ctx2_5k, source_quote_instruction=_sq)
+    periodes_prompt = PROMPT_PERIODES.format(text_chunk_1=text_chunk_1, text_chunk_2=_ctx2_5k, source_quote_instruction=_sq)
+    voorwaarden_prompt = PROMPT_VOORWAARDEN.format(text_chunk_1=text_chunk_1, text_chunk_2=_ctx2_5k, source_quote_instruction=_sq)
+    juridisch_prompt = PROMPT_JURIDISCH.format(text_chunk_1=text_chunk_1, text_chunk_2=_ctx2_5k, source_quote_instruction=_sq)
+    metadata_prompt = PROMPT_METADATA.format(text_chunk_1=text_chunk_1[:5000], source_quote_instruction=_sq)
 
     stages = {
         "metadata": metadata_prompt,
@@ -2498,6 +2271,7 @@ ALLEEN JSON:"""
         "juridisch": juridisch_prompt
     }
 
+    # Prompts staan in prompts.py
     for stage_name, prompt in stages.items():
         print(f"      📊 Extracting {stage_name}...")
         # Altijd AI-extractie per stage (geen skip op basis van regex), zodat we alle velden krijgen.
@@ -2530,6 +2304,8 @@ ALLEEN JSON:"""
                 non_null_count = sum(1 for v in json.dumps(stage_data).split()
                                      if v not in ['null', 'None', '""', '{}', '[]',"ONTBREKEND"])
                 print(f"         ✓ {non_null_count} data points extracted")
+                if extract_key_idx is not None:
+                    record_extract_use(extract_key_idx)
                 break
 
             except json.JSONDecodeError as e:
@@ -2580,18 +2356,28 @@ ALLEEN JSON:"""
         "juridisch": extracted_sections.get("juridisch", {})
     }
 
+    if pages_text:
+        _add_source_pages(final_data, pages_text)
+
     # ========================================================================
     # VALIDATION & REPORTING
     # ========================================================================
 
     print("\n      📋 EXTRACTION SUMMARY:")
 
+    def _get_leaf(obj: dict, *keys: str) -> Any:
+        for k in keys:
+            obj = obj.get(k) if isinstance(obj, dict) else None
+            if obj is None:
+                return None
+        return obj
+
     critical_fields = {
-        "Huurprijs": final_data.get("financieel", {}).get("huurprijs"),
-        "Ingangsdatum": final_data.get("periodes", {}).get("ingangsdatum"),
-        "Verhuurder naam": final_data.get("partijen", {}).get("verhuurder", {}).get("naam"),
-        "Huurder naam": final_data.get("partijen", {}).get("huurder", {}).get("naam"),
-        "Pand adres": final_data.get("pand", {}).get("adres")
+        "Huurprijs": _unwrap_field_value(_get_leaf(final_data, "financieel", "huurprijs")),
+        "Ingangsdatum": _unwrap_field_value(_get_leaf(final_data, "periodes", "ingangsdatum")),
+        "Verhuurder naam": _unwrap_field_value(_get_leaf(final_data, "partijen", "verhuurder", "naam")),
+        "Huurder naam": _unwrap_field_value(_get_leaf(final_data, "partijen", "huurder", "naam")),
+        "Pand adres": _unwrap_field_value(_get_leaf(final_data, "pand", "adres"))
     }
 
     found_critical = sum(1 for v in critical_fields.values() if v)
@@ -2608,16 +2394,21 @@ ALLEEN JSON:"""
     def count_fields(obj):
         nonlocal total_fields, filled_fields
         if isinstance(obj, dict):
-            for k, v in obj.items():
-                if isinstance(v, (dict, list)):
+            if "value" in obj and not any(k not in ("value", "source_quote", "source_page") for k in obj):
+                total_fields += 1
+                w = obj.get("value")
+                if w is not None and w != "" and w != []:
+                    filled_fields += 1
+            else:
+                for v in obj.values():
                     count_fields(v)
-                else:
-                    total_fields += 1
-                    if v is not None and v != "" and v != []:
-                        filled_fields += 1
         elif isinstance(obj, list):
             for item in obj:
                 count_fields(item)
+        else:
+            total_fields += 1
+            if obj is not None and obj != "" and obj != []:
+                filled_fields += 1
 
     count_fields(final_data)
 
@@ -2645,11 +2436,11 @@ def calculate_confidence_normalized(normalized_data: dict, full_text: str,
 
     # Critical fields check (40 points max)
     critical_fields = {
-        'huurprijs': normalized_data.get('financieel', {}).get('huurprijs'),
-        'ingangsdatum': normalized_data.get('periodes', {}).get('ingangsdatum'),
-        'verhuurder_naam': normalized_data.get('partijen', {}).get('verhuurder', {}).get('naam'),
-        'huurder_naam': normalized_data.get('partijen', {}).get('huurder', {}).get('naam'),
-        'pand_adres': normalized_data.get('pand', {}).get('adres')
+        'huurprijs': _unwrap_field_value(normalized_data.get('financieel', {}).get('huurprijs')),
+        'ingangsdatum': _unwrap_field_value(normalized_data.get('periodes', {}).get('ingangsdatum')),
+        'verhuurder_naam': _unwrap_field_value(normalized_data.get('partijen', {}).get('verhuurder', {}).get('naam')),
+        'huurder_naam': _unwrap_field_value(normalized_data.get('partijen', {}).get('huurder', {}).get('naam')),
+        'pand_adres': _unwrap_field_value(normalized_data.get('pand', {}).get('adres'))
     }
 
     found_critical = sum(1 for v in critical_fields.values() if v and v != "")
@@ -2665,6 +2456,12 @@ def calculate_confidence_normalized(normalized_data: dict, full_text: str,
         total = 0
         filled = 0
         if isinstance(obj, dict):
+            if "value" in obj and not any(k not in ("value", "source_quote", "source_page") for k in obj):
+                total += 1
+                v = obj.get("value")
+                if v is not None and v != "" and v != [] and v != {}:
+                    filled += 1
+                return total, filled
             for k, v in obj.items():
                 if isinstance(v, (dict, list)):
                     t, f = count_filled_fields(v)
@@ -2684,6 +2481,30 @@ def calculate_confidence_normalized(normalized_data: dict, full_text: str,
     total_fields, filled_fields = count_filled_fields(normalized_data)
     completeness = (filled_fields / total_fields) if total_fields > 0 else 0
     score += completeness * 30
+
+    # Source-quote coverage: velden met bronvermelding (proxy voor controleerbaarheid)
+    def count_source_quotes(obj):
+        total_leaf = 0
+        with_quote = 0
+        if isinstance(obj, dict):
+            if "value" in obj and not any(k not in ("value", "source_quote", "source_page") for k in obj):
+                total_leaf += 1
+                if obj.get("source_quote"):
+                    with_quote += 1
+                return total_leaf, with_quote
+            for k, v in obj.items():
+                t, w = count_source_quotes(v)
+                total_leaf += t
+                with_quote += w
+        elif isinstance(obj, list):
+            for item in obj:
+                t, w = count_source_quotes(item)
+                total_leaf += t
+                with_quote += w
+        return total_leaf, with_quote
+
+    fields_with_value, fields_with_source_quote = count_source_quotes(normalized_data)
+    source_quote_pct = (fields_with_source_quote / fields_with_value) if fields_with_value > 0 else 0.0
 
     # Text quality (10 points max)
     text_length = len(full_text.strip())
@@ -2722,29 +2543,21 @@ def calculate_confidence_normalized(normalized_data: dict, full_text: str,
             'text_length': text_length,
             'completeness': completeness,
             'critical_fields_found': found_critical,
-            'critical_fields_total': len(critical_fields)
+            'critical_fields_total': len(critical_fields),
+            'source_quote_pct': source_quote_pct,
+            'fields_with_source_quote': fields_with_source_quote,
+            'fields_with_value': fields_with_value,
         }
     }
 
 
-def generate_summary(full_text: str, doc_type: str, gemini_client, model) -> str:
+def generate_summary(full_text: str, doc_type: str, gemini_client, model, extract_key_idx: Optional[int] = None) -> str:
     """Generate natural language summary using Gemini"""
 
     # Use first N chars for summary
     text_sample = full_text[:SUMMARY_TEXT_SIZE] if len(full_text) > SUMMARY_TEXT_SIZE else full_text
 
-    prompt = f"""Maak een bondige samenvatting van dit {doc_type} in maximaal 3 korte alinea's.
-
-Focus op:
-- Partijen (verhuurder en huurder)
-- Pand (adres en kenmerken)
-- Financiële voorwaarden (huur, waarborg)
-- Belangrijkste termijnen en voorwaarden
-
-CONTRACT TEKST:
-{text_sample}
-
-Geef ALLEEN de samenvatting (geen introductie):"""
+    prompt = PROMPT_SUMMARY.format(doc_type=doc_type, text_sample=text_sample)
 
     try:
         for attempt in range(MAX_RETRIES):
@@ -2754,11 +2567,13 @@ Geef ALLEEN de samenvatting (geen introductie):"""
                     contents=prompt,
                     config=types.GenerateContentConfig(
                         temperature=0.3,
-                        max_output_tokens=3000
+                        max_output_tokens=3000,
                     )
                 )
 
                 summary = response.text.strip()
+                if extract_key_idx is not None:
+                    record_extract_use(extract_key_idx)
                 return summary
 
             except Exception as e:
@@ -2832,7 +2647,7 @@ def process_rental_contract(clients, pdf_info):
         _, response = dbx_analyze.files_download(pdf_info['path'])
 
         print(f"📖 Extracting text...")
-        full_text, pdf_metadata = extract_text_with_ocr(response.content, gemini, model)
+        full_text, pdf_metadata, pages_text = extract_text_with_ocr(response.content, gemini, model, extract_key_idx=key_idx)
         print(f"✓ Text: {len(full_text)} chars")
         record_extraction_method(pdf_metadata.get("ocr_engine", "text_layer"))
 
@@ -2842,7 +2657,7 @@ def process_rental_contract(clients, pdf_info):
 
         # Extract raw data
         print("🤖 Gemini analyzing contract...")
-        contract_data = extract_contract_data(full_text, gemini, model)
+        contract_data = extract_contract_data(full_text, gemini, model, pages_text=pages_text, extract_key_idx=key_idx)
 
         if contract_data.get('error') == 'QUOTA_EXCEEDED':
             print(f"❌ QUOTA EXCEEDED - requeuing document for retry")
@@ -2865,7 +2680,7 @@ def process_rental_contract(clients, pdf_info):
                                                      "huurovereenkomst", True)
 
         # Generate summary
-        summary = generate_summary(full_text, "huurovereenkomst", gemini, model)
+        summary = generate_summary(full_text, "huurovereenkomst", gemini, model, extract_key_idx=key_idx)
 
         if "QUOTA_EXCEEDED" in summary:
             print(f"❌ QUOTA EXCEEDED - requeuing document for retry")
@@ -2900,9 +2715,40 @@ def process_rental_contract(clients, pdf_info):
         ts = datetime.now().strftime('%Y%m%d_%H%M%S')
         base = pdf_info['name'].replace('.pdf', '')
 
+        path_upper = (pdf_info.get('path') or '').upper().replace('\\', '/')
+        if '/EPC/' in path_upper or path_upper.rstrip('/').endswith('/EPC'):
+            doc_type = 'epc'
+        elif '/ASBEST/' in path_upper or path_upper.rstrip('/').endswith('/ASBEST'):
+            doc_type = 'asbest'
+        elif '/KADASTER/' in path_upper or path_upper.rstrip('/').endswith('/KADASTER') or '/EIGENDOMSTITEL/' in path_upper:
+            doc_type = 'kadaster'
+        else:
+            doc_type = 'huurcontract'
+
+        # Voor EPC/kadaster/asbest: als pand.adres ontbreekt, afleiden uit mappad (bv. .../Beukenhof_14B/EPC/file.pdf → Beukenhof 14B)
+        if doc_type in ('epc', 'kadaster', 'asbest'):
+            pand = normalized_data.get('pand') or {}
+            if not isinstance(pand, dict):
+                pand = {}
+            current_adres = pand.get('adres')
+            adres_val = _unwrap_field_value(current_adres) if current_adres is not None else None
+            if not adres_val or (isinstance(adres_val, str) and not adres_val.strip()):
+                path_str = (pdf_info.get('path') or '').replace('\\', '/').strip('/')
+                parts = [p for p in path_str.split('/') if p]
+                sub_names = ('EPC', 'ASBEST', 'KADASTER', 'EIGENDOMSTITEL')
+                adres_folder = None
+                for i, seg in enumerate(parts):
+                    if seg.upper() in sub_names and i > 0:
+                        adres_folder = parts[i - 1]
+                        break
+                if adres_folder:
+                    derived_adres = adres_folder.replace('_', ' ').strip()
+                    if derived_adres:
+                        normalized_data.setdefault('pand', {})['adres'] = derived_adres
+
         json_data = {
             "filename": result['filename'],
-            "document_type": result['title'],
+            "document_type": doc_type,
             "type_verified": result['type_verified'],
             "processed": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             "confidence": result['confidence'],
@@ -3030,24 +2876,6 @@ def process_rental_contract(clients, pdf_info):
         log_to_csv(dbx_target, pdf_info['name'], result, json_name, "success")
 
         # Send email - alleen als verwerking succesvol was
-        conf = result['confidence']
-
-        if conf['score'] >= TARGET_CONFIDENCE and not conf['needs_review']:
-            status_section = f"""STATUS
-Confidence Score: {conf['score']}%
-Assessment: ✅ Approved
-Data Completeness: {conf['metrics'].get('completeness', 0):.0%}
-"""
-        else:
-            status_section = f"""STATUS
-Confidence Score: {conf['score']}%
-Assessment: ⚠️ Review Required
-Data Completeness: {conf['metrics'].get('completeness', 0):.0%}
-
-ATTENTION POINTS
-{conf['details']}
-"""
-
         # Add key contract details
         normalized = result['normalized_data']
         details_section = ""
@@ -3089,41 +2917,20 @@ Start Date: {start}
 Duration: {duur}
 """
 
-        email_body = f"""Dear,
-
-Please find attached the automated analysis of the following document:
-
-DOCUMENT INFORMATION
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Filename: {pdf_info['name']}
-Type: {result['title']}
-Size: {format_file_size(len(response.content))}
-Processing Date: {datetime.now().strftime('%d-%m-%Y %H:%M')}
-
-{status_section}
-KEY DATA
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{details_section}
-SUMMARY
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-{result['summary']}
-
-STRUCTURED DATA
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Full JSON available in Dropbox:
-{json_file}
-
-✅ JSON ready for import into your v0 website
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-This analysis was automatically generated.
-Please review the data for documents requiring review.
-
-Best regards,
-Automated Document Processing System
-"""
-
-        subject = f"Contract Processed: {result['title']} - {pdf_info['name']}"
-        send_email(subject, email_body)
+        subject = EMAIL_SUBJECT.format(
+            title=result['title'],
+            filename=pdf_info['name'],
+        )
+        email_body = EMAIL_BODY.format(
+            filename=pdf_info['name'],
+            title=result['title'],
+            details_section=details_section,
+            summary=result['summary'],
+        )
+        image_path = None
+        if EMAIL_IMAGE_PATH:
+            image_path = EMAIL_IMAGE_PATH if os.path.isabs(EMAIL_IMAGE_PATH) else os.path.join(_script_dir, EMAIL_IMAGE_PATH)
+        send_email(subject, email_body, image_path=image_path)
 
         if result['confidence']['needs_review']:
             print("⚠️  Review required")
@@ -3221,6 +3028,9 @@ def analyze_rental_contracts(clients, analyzed_history):
     quota_hit = False
 
     for i, pdf_info in enumerate(new_pdfs, 1):
+        if _shutdown_requested[0]:
+            print("\n⏹️  Stop aangevraagd - analyse afgebroken.")
+            break
         print(f"\n📋 Contract {i}/{len(new_pdfs)}")
         print(f"   Path: {pdf_info['path']}")
 
@@ -3292,6 +3102,10 @@ def main():
 ╚══════════════════════════════════════════════════════════════════════╝
     """)
 
+    # Ctrl+C: flag zetten zodat we na de huidige bewerking stoppen (niet midden in een API-call)
+    signal.signal(signal.SIGINT, _sigint_handler)
+    _shutdown_requested[0] = False
+
     # Initialize
     clients = init_clients()
 
@@ -3312,6 +3126,9 @@ def main():
     print(f"{'='*70}\n")
 
     while True:
+        if _shutdown_requested[0]:
+            print("\n\n⏹️  Stopped by user")
+            break
         try:
             # PHASE 1: Organize batch
             organized_count = organize_batch(clients, folder_mgr, organized_history, BATCH_SIZE)
@@ -3338,7 +3155,10 @@ def main():
                           end='\r', flush=True)
 
             print_pipeline_stats()
-            # Wait before next cycle
+            # Wait before next cycle (stop als gebruiker Ctrl+C heeft gedrukt)
+            if _shutdown_requested[0]:
+                print("\n\n⏹️  Stopped by user")
+                break
             time.sleep(CHECK_INTERVAL)
 
         except KeyboardInterrupt:
@@ -3378,12 +3198,12 @@ def backfill_document_text(dropbox_path: str) -> bool:
         print(f"❌ Dropbox download failed: {e}")
         return False
     print("📖 Tekst extraheren...")
-    api_key, _ = get_next_extract_key()
+    api_key, key_idx = get_next_extract_key()
     if not api_key:
         print("❌ Geen extract-key beschikbaar (12 keys op 18/24u)")
         return False
     gemini = genai.Client(api_key=api_key)
-    full_text, _ = extract_text_with_ocr(pdf_bytes, gemini, clients["model_analyze"])
+    full_text, _, _ = extract_text_with_ocr(pdf_bytes, gemini, clients["model_analyze"], extract_key_idx=key_idx)
     if len(full_text.strip()) < 20:
         print("⚠️  Te weinig tekst geëxtraheerd")
         return False
