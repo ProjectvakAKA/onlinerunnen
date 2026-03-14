@@ -1,0 +1,86 @@
+{
+  "/Georganiseerd/Contracten": {
+    "name": "Contracten",
+    "created": "2026-03-14T23:04:10.761571",
+    "description": "Auto-detected",
+    "file_count": 0
+  },
+  "/Georganiseerd/Teksten": {
+    "name": "Teksten",
+    "created": "2026-03-14T23:04:11.010051",
+    "description": "Auto-detected",
+    "file_count": 3
+  },
+  "/Georganiseerd/Onderwijs": {
+    "name": "Onderwijs",
+    "created": "2026-03-14T23:04:11.278348",
+    "description": "Auto-detected",
+    "file_count": 0
+  },
+  "/Georganiseerd/Facturen": {
+    "name": "Facturen",
+    "created": "2026-03-14T23:04:11.534541",
+    "description": "Auto-detected",
+    "file_count": 1
+  },
+  "/Georganiseerd/Reizen": {
+    "name": "Reizen",
+    "created": "2026-03-14T23:04:11.797078",
+    "description": "Auto-detected",
+    "file_count": 0
+  },
+  "/Georganiseerd/Verhaal": {
+    "name": "Verhaal",
+    "created": "2026-03-14T23:04:12.064689",
+    "description": "Auto-detected",
+    "file_count": 4
+  },
+  "/Georganiseerd/Contracten/Huurcontracten/Beukenhof_14B": {
+    "name": "Beukenhof_14B",
+    "created": "2026-03-14T23:04:20.517386",
+    "description": "Duidelijk huurcontract voor het adres Beukenhof 14B; de map voor dit specifieke adres en type contract bestaat nog niet.",
+    "file_count": 1
+  },
+  "/Georganiseerd/Contracten/Huurcontracten/Prinsengracht_456": {
+    "name": "Prinsengracht_456",
+    "created": "2026-03-14T23:04:39.618899",
+    "description": "Duidelijk een huurovereenkomst voor Prinsengracht 456; de map voor dit specifieke adres en type contract bestaat nog niet.",
+    "file_count": 1
+  },
+  "/Georganiseerd/Contracten/Huurcontracten/Maria-Theresiastraat_78_bus_4": {
+    "name": "Maria-Theresiastraat_78_bus_4",
+    "created": "2026-03-14T23:30:46.266792",
+    "description": "Duidelijk een huurovereenkomst voor Maria-Theresiastraat 78 bus 4; de map voor dit specifieke adres en type contract bestaat nog niet.",
+    "file_count": 1
+  },
+  "/Georganiseerd/Contracten/Huurcontracten/Meir_78_bus_3": {
+    "name": "Meir_78_bus_3",
+    "created": "2026-03-14T23:31:06.471132",
+    "description": "Duidelijk een huurcontract voor het adres Meir 78 bus 3; de map voor dit specifieke adres en type contract bestaat nog niet in de bestaande mappen.",
+    "file_count": 1
+  },
+  "/Georganiseerd/Contracten/Huurcontracten/Louizalaan_210_bus_5": {
+    "name": "Louizalaan_210_bus_5",
+    "created": "2026-03-14T23:31:27.976137",
+    "description": "Duidelijk een huurcontract voor het adres Louizalaan 210 bus 5; de map voor dit specifieke adres en type contract bestaat nog niet in de bestaande mappen.",
+    "file_count": 1
+  },
+  "/Georganiseerd/Contracten/Huurcontracten/Lijsterlaan_88": {
+    "name": "Lijsterlaan_88",
+    "created": "2026-03-14T23:31:50.376225",
+    "description": "Dit is een duidelijk huurcontract voor het adres Lijsterlaan 88. De map voor dit specifieke adres en type contract bestaat nog niet in de bestaande mappen.",
+    "file_count": 1
+  },
+  "/Georganiseerd/Contracten/Huurcontracten/Kortrijksesteenweg_112_bus_3": {
+    "name": "Kortrijksesteenweg_112_bus_3",
+    "created": "2026-03-14T23:32:12.180162",
+    "description": "Duidelijk een huurovereenkomst voor het adres Kortrijksesteenweg 112 bus 3; de map voor dit specifieke adres en type contract bestaat nog niet in de bestaande mappen.",
+    "file_count": 1
+  },
+  "/Georganiseerd/Contracten/Huurcontracten/Kapelstraat_29": {
+    "name": "Kapelstraat_29",
+    "created": "2026-03-14T23:32:48.636616",
+    "description": "Duidelijk een huurovereenkomst voor het adres Kapelstraat 29; de map voor dit specifieke adres en type contract bestaat nog niet in de bestaande mappen.",
+    "file_count": 1
+  }
+}
