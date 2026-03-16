@@ -15,7 +15,7 @@
     "name": "Onderwijs",
     "created": "2026-03-14T23:04:11.278348",
     "description": "Auto-detected",
-    "file_count": 0
+    "file_count": 1
   },
   "/Georganiseerd/Facturen": {
     "name": "Facturen",
@@ -81,6 +81,60 @@
     "name": "Kapelstraat_29",
     "created": "2026-03-14T23:32:48.636616",
     "description": "Duidelijk een huurovereenkomst voor het adres Kapelstraat 29; de map voor dit specifieke adres en type contract bestaat nog niet in de bestaande mappen.",
+    "file_count": 1
+  },
+  "/Georganiseerd/Contracten/Huurcontracten/Tiensevest_12_bus_3": {
+    "name": "Tiensevest_12_bus_3",
+    "created": "2026-03-16T17:29:48.971467",
+    "description": "Dit is een duidelijke huurovereenkomst voor woongelegenheid voor het adres Tiensevest 12, bus 3. De map voor dit specifieke adres en type contract bestaat nog niet in de bestaande mappen.",
+    "file_count": 2
+  },
+  "/Georganiseerd/Contracten/Huurcontracten/Vrijdagmarkt_33": {
+    "name": "Vrijdagmarkt_33",
+    "created": "2026-03-16T18:00:55.172847",
+    "description": "Dit is een duidelijke handelshuurovereenkomst voor het adres Vrijdagmarkt 33, 9000 Gent. De map voor dit specifieke adres en type contract bestaat nog niet in de bestaande mappen.",
+    "file_count": 1
+  },
+  "/Georganiseerd/Contracten/Huurcontracten/Quellinstraat_8_bus_5": {
+    "name": "Quellinstraat_8_bus_5",
+    "created": "2026-03-16T18:15:29.471679",
+    "description": "Duidelijke huurovereenkomst voor woongelegenheid voor het adres Quellinstraat 8, bus 5; de map voor dit specifieke adres en type contract bestaat nog niet in de bestaande mappen.",
+    "file_count": 1
+  },
+  "/Georganiseerd/Contracten/Huurcontracten/Langestraat_42_bus_3": {
+    "name": "Langestraat_42_bus_3",
+    "created": "2026-03-16T20:05:19.229516",
+    "description": "Duidelijke huurovereenkomst voor woongelegenheid voor het adres Langestraat 42, bus 3, 8000 Brugge; de map voor dit specifieke adres en type contract bestaat nog niet in de bestaande mappen.",
+    "file_count": 1
+  },
+  "/Georganiseerd/Contracten/Huurcontracten/IJzerenleen_3_penthouse": {
+    "name": "IJzerenleen_3_penthouse",
+    "created": "2026-03-16T20:14:56.046338",
+    "description": "Duidelijk een huurovereenkomst voor woongelegenheid voor het adres IJzerenleen 3, penthouse, 2800 Mechelen; de map voor dit specifieke adres en type contract bestaat nog niet in de bestaande mappen.",
+    "file_count": 1
+  },
+  "/Georganiseerd/Contracten/Huurcontracten/Groendreef_17": {
+    "name": "Groendreef_17",
+    "created": "2026-03-16T20:15:22.451244",
+    "description": "Duidelijke huurovereenkomst voor woongelegenheid voor het adres Groendreef 17, 9000 Gent; de map voor dit specifieke adres en type contract bestaat nog niet in de bestaande mappen.",
+    "file_count": 1
+  },
+  "/Georganiseerd/Contracten/Huurcontracten/Leopoldwal_12": {
+    "name": "Leopoldwal_12",
+    "created": "2026-03-16T20:30:32.415602",
+    "description": "Duidelijke huurovereenkomst voor woongelegenheid voor het adres Leopoldwal 12, 3700 Tongeren; de map voor dit specifieke adres en type contract bestaat nog niet in de bestaande mappen.",
+    "file_count": 1
+  },
+  "/Georganiseerd/Contracten/Limburg/Havermarkt_7_bus_4": {
+    "name": "Havermarkt_7_bus_4",
+    "created": "2026-03-16T21:13:44.483798",
+    "description": "Duidelijk een huurovereenkomst voor woongelegenheid voor het adres Havermarkt 7 bus 4, 3500 Hasselt (Limburg); de map voor dit specifieke adres en type contract bestaat nog niet in de bestaande mappen.",
+    "file_count": 1
+  },
+  "/Georganiseerd/Contracten/Brussel/Kerkstraat_1": {
+    "name": "Kerkstraat_1",
+    "created": "2026-03-16T21:42:24.814413",
+    "description": "Dit is een Energieprestatiecertificaat (EPC) voor het adres Kerkstraat 1, 1000 Brussel. De map voor dit specifieke adres en type contract bestaat nog niet in de bestaande mappen.",
     "file_count": 1
   }
 }

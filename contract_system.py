@@ -77,6 +77,7 @@ from prompts import (
     PROMPT_OCR_VISION,
     PROMPT_ORGANIZE,
     SOURCE_QUOTE_INSTRUCTION,
+    WORD_IDS_INSTRUCTION,
     PROMPT_PARTIJEN,
     PROMPT_PAND,
     PROMPT_FINANCIEEL,
@@ -84,6 +85,7 @@ from prompts import (
     PROMPT_VOORWAARDEN,
     PROMPT_JURIDISCH,
     PROMPT_METADATA,
+    PROMPT_EPC,
     PROMPT_SUMMARY,
     EMAIL_SUBJECT,
     EMAIL_BODY,
@@ -301,19 +303,17 @@ FOLDER_CACHE = os.path.join(_script_dir, "folder_structure.json")
 CSV_LOG_PATH = "/verwerking_log.csv"
 CSV_LOG_PATH_NEW = "/verwerking_log_v2.csv"
 NEW_CSV_HEADER = (
-    'timestamp,filename,document_type,confidence_score,needs_review,text_length,fields_complete,'
+    'timestamp,filename,document_type,confidence_score,text_length,fields_complete,'
     'source_quote_pct,extracted_huurprijs,extracted_adres,extracted_ingangsdatum,extracted_verhuurder,extracted_huurder,'
     'issues,warnings,json_path,processing_status\n'
 )
+# Let op: verwerking_log gebruikt geen needs_review meer; confidence_score blijft voor ordening.
 
 # Retry settings
 MAX_RETRIES = 3
 RETRY_WAIT = 15
 RATE_LIMIT_WAIT = 90
 QUOTA_EXCEEDED_WAIT = 3600
-
-# Confidence target
-TARGET_CONFIDENCE = 95
 
 # Folders to exclude from organizing
 EXCLUDE_FOLDERS = {
@@ -345,6 +345,9 @@ INITIAL_PAGES_TO_SCAN = 5  # Pages to scan initially
 MAX_PAGES_TO_SCAN = 15  # Maximum pages to scan
 OCR_PAGES_LIMIT = 3  # Maximum pages for OCR
 OCR_DPI = 200  # DPI for OCR image conversion
+OCR_VISION_MIN_CHARS = 100  # Onder deze lengte: opnieuw Vision proberen
+OCR_VISION_RETRIES = 3  # Aantal Vision-pogingen bij te weinig tekst
+OCR_VISION_RETRY_WAIT = 10  # Seconden wachten tussen Vision-retries
 
 # ============================================================================
 # RETRY DECORATOR
@@ -487,13 +490,21 @@ class ContractNormalizer:
         return None
 
     def _number_field_for_output(self, obj: Any, *keys: str) -> Any:
-        """Like _extract_number but preserves source_quote/source_page when present (for PDF highlight + UI)."""
+        """Like _extract_number but preserves source_quote/source_page/word_ids when present (for PDF highlight + UI)."""
         v = self._safe_get(obj, *keys, default=None)
         if v is None or v == "":
             return None
         num = self._extract_number(v)
-        if isinstance(v, dict) and "value" in v and (v.get("source_quote") is not None or v.get("source_page") is not None):
-            return {"value": num, "source_quote": v.get("source_quote"), "source_page": v.get("source_page")}
+        has_source = (
+            isinstance(v, dict)
+            and "value" in v
+            and (v.get("source_quote") is not None or v.get("source_page") is not None or v.get("word_ids") is not None)
+        )
+        if has_source:
+            out = {"value": num, "source_quote": v.get("source_quote"), "source_page": v.get("source_page")}
+            if v.get("word_ids") is not None:
+                out["word_ids"] = v["word_ids"]
+            return out
         return num
 
     def _normalize_boolean(self, value: Any) -> Optional[bool]:
@@ -587,7 +598,7 @@ class ContractNormalizer:
 
         # Extract address as simple string
         adres_raw = self._safe_get(pand, 'adres', default={})
-        if isinstance(adres_raw, dict) and "value" in adres_raw and not any(k not in ("value", "source_quote", "source_page") for k in adres_raw):
+        if isinstance(adres_raw, dict) and "value" in adres_raw and not any(k not in ("value", "source_quote", "source_page", "word_ids") for k in adres_raw):
             adres_str = str(adres_raw.get("value", ""))
         elif isinstance(adres_raw, dict):
             volledig = self._safe_get(adres_raw, 'volledig_adres') or self._safe_get(adres_raw, 'volledig')
@@ -620,8 +631,8 @@ class ContractNormalizer:
             "adres": self._get_field_for_output(pand, 'adres') or adres_str,
             "type": self._get_field_for_output(pand, 'type') or self._get_field_for_output(pand, 'type_woning') or "appartement",
             "oppervlakte": self._extract_number(self._safe_get_value(pand, 'oppervlakte') or self._safe_get_value(pand, 'totale_bewoonbare_oppervlakte')),
-            "aantal_kamers": self._extract_number(self._safe_get_value(pand, 'aantal_kamers') or self._safe_get_value(pand, 'kamers')),
-            "verdieping": self._extract_number(self._safe_get_value(pand, 'verdieping')),
+            "aantal_kamers": self._number_field_for_output(pand, 'aantal_kamers') or self._number_field_for_output(pand, 'kamers'),
+            "verdieping": self._number_field_for_output(pand, 'verdieping'),
             "epc": {
                 "energielabel": self._get_field_for_output(epc_data, 'energielabel') or self._get_field_for_output(epc_data, 'label') or "",
                 "certificaatnummer": self._get_field_for_output(epc_data, 'certificaatnummer') or self._get_field_for_output(epc_data, 'nummer') or "",
@@ -770,20 +781,25 @@ class ContractNormalizer:
         }
 
     def _normalize_voorwaarden_flat(self, data: dict) -> dict:
-        """Returns flat voorwaarden"""
+        """Returns flat voorwaarden. huisdieren_toelating = volledige tekst (met source_quote/word_ids voor PDF-markering)."""
         voorwaarden = self._safe_get(data, 'voorwaarden', default={})
 
-        huisdieren_raw = self._safe_get_value(voorwaarden, 'huisdieren')
-        if isinstance(huisdieren_raw, dict):
-            huisdieren = self._normalize_boolean(self._safe_get_value(huisdieren_raw, 'toegestaan'))
-        else:
-            huisdieren = self._normalize_boolean(huisdieren_raw)
+        # Uitgebreide huisdierenbepaling (tekst + bron voor fluor)
+        huisdieren_toelating = self._get_field_for_output(voorwaarden, 'huisdieren_toelating')
+        if huisdieren_toelating is None:
+            # Fallback: oude veld "huisdieren" (boolean) als string voor weergave
+            huisdieren_raw = self._safe_get_value(voorwaarden, 'huisdieren')
+            if isinstance(huisdieren_raw, dict):
+                h = self._normalize_boolean(self._safe_get_value(huisdieren_raw, 'toegestaan'))
+            else:
+                h = self._normalize_boolean(huisdieren_raw)
+            huisdieren_toelating = "Ja" if h is True else ("Nee" if h is False else "")
 
         onderverhuur = self._normalize_boolean(self._safe_get_value(voorwaarden, 'onderverhuur'))
         werken = self._get_field_for_output(voorwaarden, 'werken') or ""
 
         return {
-            "huisdieren": huisdieren,
+            "huisdieren_toelating": huisdieren_toelating,
             "onderverhuur": onderverhuur,
             "werken": werken
         }
@@ -1226,11 +1242,55 @@ def _csv_cell(v):
     """One value for CSV; unwrap source objects to display value."""
     if v is None or v == "":
         return ""
-    if isinstance(v, dict) and "value" in v and not any(k not in ("value", "source_quote", "source_page") for k in v):
+    if isinstance(v, dict) and "value" in v and not any(k not in ("value", "source_quote", "source_page", "word_ids") for k in v):
         v = v.get("value")
     if v is None or v == "":
         return ""
     return str(v).strip()
+
+
+# API performance log (lokaal, voor tracking Gemini-calls)
+API_PERFORMANCE_LOG = os.path.join(_script_dir, "api_performance.csv")
+API_PERFORMANCE_HEADER = (
+    "timestamp_iso,operation,document_type,filename,duration_sec,success,error,model,key_index,extraction_method\n"
+)
+
+
+def log_api_performance(
+    operation: str,
+    filename: str,
+    duration_sec: float,
+    success: bool,
+    document_type: Optional[str] = None,
+    error: Optional[str] = None,
+    model: Optional[str] = None,
+    key_index: Optional[int] = None,
+    extraction_method: Optional[str] = None,
+) -> None:
+    """Schrijf één regel naar api_performance.csv voor consistente API-performance tracking."""
+    try:
+        ts = datetime.now().isoformat()
+        err = (error or "").replace('"', '""').strip()[:500]
+        row = [
+            ts,
+            operation,
+            document_type or "",
+            filename,
+            f"{duration_sec:.2f}",
+            "1" if success else "0",
+            err,
+            model or "",
+            str(key_index) if key_index is not None else "",
+            extraction_method or "",
+        ]
+        line = ",".join('"' + str(f).replace('"', '""') + '"' for f in row) + "\n"
+        file_exists = os.path.isfile(API_PERFORMANCE_LOG)
+        with open(API_PERFORMANCE_LOG, "a", encoding="utf-8") as f:
+            if not file_exists or os.path.getsize(API_PERFORMANCE_LOG) == 0:
+                f.write(API_PERFORMANCE_HEADER)
+            f.write(line)
+    except Exception as e:
+        logger.warning(f"API performance log write failed: {e}")
 
 
 def log_to_csv(dbx_target, filename, result, json_path, status="success"):
@@ -1278,7 +1338,6 @@ def log_to_csv(dbx_target, filename, result, json_path, status="success"):
             filename,
             result.get('title', 'Unknown'),
             str(conf.get('score', 0)),
-            'Yes' if conf.get('needs_review', True) else 'No',
             str(metrics.get('text_length', 0)),
             f"{metrics.get('completeness', 0):.0%}",
             f"{metrics.get('source_quote_pct', 0):.0%}",
@@ -1437,8 +1496,7 @@ def init_clients():
 # ============================================================================
 _pipeline_stats = {
     "text_layer": 0,
-    "ocr_google_vision": 0,
-    "ocr_vision": 0,  # Gemini Vision fallback
+    "ocr_vision": 0,  # Gemini Vision voor gescande PDFs
     "contract_stages_rules": 0,
     "contract_stages_ai": 0,
 }
@@ -1458,11 +1516,11 @@ def record_contract_stages(rules_count: int, ai_count: int):
 
 def print_pipeline_stats():
     """Stap 8: toon % documenten via regels / AI / OCR-fallback."""
-    total_docs = _pipeline_stats["text_layer"] + _pipeline_stats["ocr_google_vision"] + _pipeline_stats["ocr_vision"]
+    total_docs = _pipeline_stats["text_layer"] + _pipeline_stats["ocr_vision"]
     if total_docs == 0:
         return
     print("\n📊 Pipeline stats (deze run)")
-    print(f"   Tekst: {_pipeline_stats['text_layer']} tekstlaag, {_pipeline_stats['ocr_google_vision']} Google Vision, {_pipeline_stats['ocr_vision']} Gemini Vision (fallback)")
+    print(f"   Tekst: {_pipeline_stats['text_layer']} tekstlaag, {_pipeline_stats['ocr_vision']} Gemini Vision (OCR)")
     total_stages = _pipeline_stats["contract_stages_rules"] + _pipeline_stats["contract_stages_ai"]
     if total_stages:
         pct_rules = 100 * _pipeline_stats["contract_stages_rules"] / total_stages
@@ -1470,36 +1528,8 @@ def print_pipeline_stats():
 
 
 # ============================================================================
-# PDF TEXT EXTRACTION WITH OCR (Stap 2: pdfplumber → Google Vision → Gemini Vision fallback)
+# PDF TEXT EXTRACTION WITH OCR (pdfplumber → Gemini Vision voor gescande PDFs)
 # ============================================================================
-
-def extract_text_google_vision(image_data: List[bytes], api_key: str) -> str:
-    """OCR met Google Cloud Vision API (DOCUMENT_TEXT_DETECTION). Key in .env.local: GOOGLE_VISION_API_KEY."""
-    if not api_key or not api_key.strip() or not image_data:
-        return ""
-    import urllib.request
-    requests_list = []
-    for img_bytes in image_data:
-        b64 = base64.b64encode(img_bytes).decode("utf-8")
-        requests_list.append({
-            "image": {"content": b64},
-            "features": [{"type": "DOCUMENT_TEXT_DETECTION"}]
-        })
-    try:
-        url = "https://vision.googleapis.com/v1/images:annotate?key=" + api_key.strip()
-        body = json.dumps({"requests": requests_list}).encode("utf-8")
-        req = urllib.request.Request(url, data=body, method="POST", headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            data = json.loads(resp.read().decode())
-        out = []
-        for r in data.get("responses", []):
-            if "fullTextAnnotation" in r and r["fullTextAnnotation"].get("text"):
-                out.append(r["fullTextAnnotation"]["text"])
-        return "\n\n".join(out) if out else ""
-    except Exception as e:
-        logger.warning(f"   Google Vision error: {e}")
-        return ""
-
 
 def extract_text_with_ocr(pdf_bytes: bytes, gemini_client, model: str,
                           initial_pages: int = INITIAL_PAGES_TO_SCAN,
@@ -1551,27 +1581,27 @@ def extract_text_with_ocr(pdf_bytes: bytes, gemini_client, model: str,
 
                 doc.close()
 
-                logger.info(f"   🔍 Running OCR on {len(image_data)} page(s)...")
+                logger.info(f"   🔍 Running OCR on {len(image_data)} page(s) (Gemini Vision)...")
 
-                # Stap 2: eerst Google Vision (aparte key); zo niet gezet of fout → Gemini Vision fallback
                 ocr_text = ""
-                google_vision_key = os.getenv("GOOGLE_VISION_API_KEY", "").strip()
-                if google_vision_key:
-                    ocr_text = extract_text_google_vision(image_data, google_vision_key)
-                    if ocr_text and len(ocr_text) > 100:
-                        cleaned_text = ocr_text
-                        extraction_method = "ocr_google_vision"
-                        logger.info(f"   ✓ Google Vision OCR: {len(cleaned_text)} chars")
-                    else:
-                        ocr_text = ""
-                if not ocr_text and gemini_client and model:
-                    ocr_text = extract_text_vision(image_data, gemini_client, model, key_idx=extract_key_idx)
-                    if ocr_text and len(ocr_text) > 100:
-                        cleaned_text = ocr_text
-                        extraction_method = "ocr_vision"
-                        logger.info(f"   ✓ Gemini Vision OCR (fallback): {len(cleaned_text)} chars")
-                    else:
-                        logger.warning(f"   ⚠️  OCR yielded little text")
+                if gemini_client and model:
+                    for vision_attempt in range(OCR_VISION_RETRIES):
+                        ocr_text = extract_text_vision(image_data, gemini_client, model, key_idx=extract_key_idx)
+                        if ocr_text and len(ocr_text.strip()) >= OCR_VISION_MIN_CHARS:
+                            cleaned_text = ocr_text
+                            extraction_method = "ocr_vision"
+                            if vision_attempt > 0:
+                                logger.info(f"   ✓ Gemini Vision OCR (poging {vision_attempt + 1}): {len(cleaned_text)} chars")
+                            else:
+                                logger.info(f"   ✓ Gemini Vision OCR: {len(cleaned_text)} chars")
+                            break
+                        if vision_attempt < OCR_VISION_RETRIES - 1:
+                            logger.warning(f"   ⚠️  Vision gaf te weinig tekst ({len(ocr_text or '')} chars) — opnieuw proberen over {OCR_VISION_RETRY_WAIT}s...")
+                            time.sleep(OCR_VISION_RETRY_WAIT)
+                    if not ocr_text or len(ocr_text.strip()) < OCR_VISION_MIN_CHARS:
+                        logger.warning(f"   ⚠️  OCR na {OCR_VISION_RETRIES} pogingen nog te weinig tekst")
+                else:
+                    logger.warning(f"   ⚠️  Geen Gemini client/model — OCR overgeslagen")
 
             except Exception as ocr_error:
                 logger.error(f"   ❌ OCR error: {ocr_error}", exc_info=True)
@@ -1615,7 +1645,7 @@ def extract_text_with_ocr(pdf_bytes: bytes, gemini_client, model: str,
             'pages_scanned': pages_scanned,
             'text_length': len(cleaned_text),
             'extraction_method': extraction_method,
-            'ocr_engine': extraction_method if extraction_method in ("ocr_google_vision", "ocr_vision") else "text_layer",
+            'ocr_engine': extraction_method if extraction_method == "ocr_vision" else "text_layer",
         }
         if extraction_method != "text" and cleaned_text:
             pages_text = [(1, cleaned_text)]
@@ -1685,6 +1715,12 @@ def _force_non_contract_out_of_contract_folders(result: dict, filename: str) -> 
     is_likely_non_contract = any(s in reasoning or s in suggested or s in name_lower for s in non_contract_signals)
 
     if not is_likely_non_contract:
+        return result
+
+    # EPC/EPB (energieprestatiecertificaat) hoort bij vastgoed/Contracten — niet naar Onderwijs
+    epc_signals = ['epc', 'epb', 'energieprestatie', 'energiecertificaat', 'energieprestatiecertificaat']
+    is_epc = any(ep in reasoning or ep in suggested or ep in name_lower for ep in epc_signals)
+    if is_epc:
         return result
 
     # Override naar inhoud-map (geen contract-map); hernoem weg van Onbekend_adres_*
@@ -1931,11 +1967,15 @@ def organize_batch(clients, folder_mgr, organized_history, max_docs=BATCH_SIZE):
 
                 # AI classification
                 print("🤖 AI analyzing document...")
+                organize_start = time.time()
                 result = smart_classify(text, pdf_info['name'], pdf_info['path'],
                                       folder_summary, gemini, model, pdf_metadata)
+                organize_duration = time.time() - organize_start
+                model_name = getattr(model, "name", str(model)) if model else ""
 
                 if not result:
                     print(f"❌ Classification failed - document stays where it is")
+                    log_api_performance("organize", pdf_info['name'], organize_duration, False, model=model_name, key_index=key_idx)
                     continue
 
                 action = result['action']
@@ -1985,6 +2025,7 @@ def organize_batch(clients, folder_mgr, organized_history, max_docs=BATCH_SIZE):
 
                     # Add to history
                     add_to_history(ORGANIZED_HISTORY, pdf_info['path'])
+                    log_api_performance("organize", pdf_info['name'], organize_duration, True, model=model_name, key_index=key_idx)
 
                     # Plan stap 1+6: samenvatting uit dezelfde call opslaan in Dropbox (zelfde map als het document)
                     summary_text = result.get('summary') or ''
@@ -2054,44 +2095,60 @@ def organize_batch(clients, folder_mgr, organized_history, max_docs=BATCH_SIZE):
 
 
 # ============================================================================
-# PHASE 2: RENTAL CONTRACT DETECTION
+# PHASE 2: CONTRACT FOLDER DETECTION (huur, EPC, asbest, kadaster, …)
 # ============================================================================
 
 def find_rental_contract_folders(dbx):
-    """Find folders likely containing rental contracts"""
+    """Find folders likely containing rental contracts (legacy: alleen huur-keywords)."""
+    return _find_contract_folders_with_pdfs(dbx, keywords_only=True)
 
-    rental_folders = []
+
+def find_contract_folders_with_pdfs(dbx):
+    """Find ALL folders under /Contracten/ that contain at least one PDF (huur, EPC, asbest, kadaster, …)."""
+    return _find_contract_folders_with_pdfs(dbx, keywords_only=False)
+
+
+def _find_contract_folders_with_pdfs(dbx, keywords_only=False):
+    """Internal: folders onder Organised die PDFs bevatten. keywords_only=True = alleen RENTAL_KEYWORDS (oude gedrag)."""
+    contract_folders = set()
 
     try:
-        # Check if organized folder exists
         try:
             dbx.files_get_metadata(ORGANIZED_FOLDER_PREFIX)
         except dropbox.exceptions.ApiError:
             print("⚠️  Organized folder niet gevonden")
             return []
 
-        # Scan recursively
+        # Recursief onder Organized zoeken naar alle PDFs; parent-map van elke PDF onder /Contracten/ bewaren
         result = dbx.files_list_folder(ORGANIZED_FOLDER_PREFIX, recursive=True)
+        contract_prefix = (ORGANIZED_FOLDER_PREFIX + "/Contracten").replace("//", "/")
 
         while True:
             for entry in result.entries:
-                if isinstance(entry, dropbox.files.FolderMetadata):
+                if isinstance(entry, dropbox.files.FileMetadata) and entry.name.lower().endswith(".pdf"):
                     path = entry.path_display
-                    path_lower = path.lower()
-
-                    # Check if folder name contains rental keywords
-                    if any(keyword in path_lower for keyword in RENTAL_KEYWORDS):
-                        rental_folders.append(path)
-                        print(f"   ✓ Huurcontract folder gevonden: {path}")
+                    if "/Contracten/" not in path:
+                        continue
+                    parent = path.rsplit("/", 1)[0]
+                    if not parent.startswith(contract_prefix):
+                        continue
+                    if keywords_only:
+                        if any(kw in parent.lower() for kw in RENTAL_KEYWORDS):
+                            contract_folders.add(parent)
+                    else:
+                        contract_folders.add(parent)
 
             if not result.has_more:
                 break
             result = dbx.files_list_folder_continue(result.cursor)
 
-    except Exception as e:
-        print(f"⚠️  Rental folder scan error: {e}")
+        for folder in sorted(contract_folders):
+            print(f"   ✓ Contract folder: {folder}")
 
-    return rental_folders
+    except Exception as e:
+        print(f"⚠️  Contract folder scan error: {e}")
+
+    return sorted(contract_folders)
 
 
 def find_pdfs_in_folders(dbx, folders):
@@ -2231,10 +2288,223 @@ def _add_source_pages(data: Any, pages_text: List[Tuple[int, str]]) -> None:
             _add_source_pages(item, pages_text)
 
 
-def extract_contract_data(full_text, gemini_client, model, initial_data: Optional[Dict[str, dict]] = None, pages_text: Optional[List[Tuple[int, str]]] = None, extract_key_idx: Optional[int] = None):
+def extract_words_with_ids(pdf_bytes: bytes) -> Tuple[Dict[int, List[Dict[str, Any]]], List[Dict[str, Any]]]:
+    """
+    Extract words with bbox from PDF using PyMuPDF. Returns (words_by_page, all_words).
+    words_by_page: 1-based page num -> list of {id, text, page, x, y, width, height}.
+    y is PDF coords (origin bottom-left) for frontend overlay.
+    """
+    words_by_page: Dict[int, List[Dict[str, Any]]] = {}
+    all_words: List[Dict[str, Any]] = []
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        global_id = 0
+        for page_idx in range(len(doc)):
+            page = doc[page_idx]
+            page_num = page_idx + 1
+            rect = page.rect
+            page_height = rect.height
+            # get_text("words") returns list of (x0, y0, x1, y1, "word", block_no, line_no, word_no)
+            word_list = page.get_text("words")
+            page_words = []
+            for w in word_list:
+                x0, y0, x1, y1 = w[0], w[1], w[2], w[3]
+                word_str = (w[4] if len(w) > 4 else "").strip()
+                if not word_str:
+                    continue
+                # PDF coords: y from bottom -> store y = page_height - y1 (bottom of word)
+                width = x1 - x0
+                height = y1 - y0
+                entry = {
+                    "id": global_id,
+                    "text": word_str,
+                    "page": page_num,
+                    "x": round(x0, 2),
+                    "y": round(page_height - y1, 2),
+                    "width": round(width, 2),
+                    "height": round(height, 2),
+                }
+                page_words.append(entry)
+                all_words.append(entry)
+                global_id += 1
+            if page_words:
+                words_by_page[page_num] = page_words
+        doc.close()
+    except Exception as e:
+        logger.warning(f"Word extraction failed: {e}")
+    return words_by_page, all_words
+
+
+def build_numbered_prompt(all_words: List[Dict[str, Any]], max_chars: int) -> str:
+    """Build '[0] word1 [1] word2 ...' until total length ~ max_chars."""
+    parts = []
+    total = 0
+    for w in all_words:
+        seg = f"[{w['id']}] {w['text']} "
+        if total + len(seg) > max_chars:
+            break
+        parts.append(seg)
+        total += len(seg)
+    return "".join(parts).strip() if parts else ""
+
+
+def get_document_type_from_path_and_name(path: str, name: str) -> str:
+    """Bepaal documenttype uit pad en bestandsnaam (oude structuur /Contracten/Type/Adres of nieuwe /Contracten/Provincie/Adres met Adres_Type.pdf)."""
+    path_upper = (path or "").upper().replace("\\", "/")
+    name_upper = (name or "").upper()
+    if "/EPC/" in path_upper or path_upper.rstrip("/").endswith("/EPC"):
+        return "epc"
+    if "_EPC." in name_upper or name_upper.endswith("_EPC.PDF") or name_upper.endswith("EPC.PDF"):
+        return "epc"
+    if "/ASBEST/" in path_upper or path_upper.rstrip("/").endswith("/ASBEST"):
+        return "asbest"
+    if "_ASBEST." in name_upper or "ASBEST." in name_upper:
+        return "asbest"
+    if "/KADASTER/" in path_upper or "/EIGENDOMSTITEL/" in path_upper:
+        return "kadaster"
+    if "_KADASTER." in name_upper or "_EIGENDOMSTITEL." in name_upper:
+        return "kadaster"
+    return "huurcontract"
+
+
+# Numeric EPC keys (must be int or float in output)
+_EPC_NUMERIC_KEYS = frozenset({
+    'vloeroppervlakte_m2', 'volume_m3', 'epb_score', 'co2_uitstoot_kg_m2_jaar',
+    'netto_energiebehoefte_verwarming', 'primair_verbruik_per_m2', 'totaal_verbruik_jaar_kwh',
+    'geschatte_jaarlijkse_energiekost_eur', 'geschatte_maandelijkse_energiekost_eur',
+    'u_waarde_venster', 'u_waarde_opaque', 'luchtdichtheid_m3_h_m2', 'aantal_niet_conform',
+    'score_energiezuinigheid', 'score_comfort', 'score_toekomstbestendigheid', 'score_totaal',
+})
+_EPC_DATE_KEYS = frozenset({'geldig_tot', 'afgeleverd_op'})
+_EPC_BOOL_KEYS = frozenset({
+    'verwarming_collectief', 'sww_collectief', 'hernieuwbare_energie',
+    'ventilatie_conform', 'voldoet_nev', 'voldoet_primair_verbruik', 'voldoet_isolatie',
+})
+
+
+def _normalize_epc_date(value: Any) -> Optional[str]:
+    """Return date in YYYY-MM-DD or None."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, str):
+        value = value.strip()
+        if not value or value.lower() in ("n/a", "ontbreekt"):
+            return None
+        for fmt in ('%Y-%m-%d', '%d-%m-%Y', '%d/%m/%Y', '%Y/%m/%d', '%d.%m.%Y'):
+            try:
+                return datetime.strptime(value, fmt).strftime('%Y-%m-%d')
+            except ValueError:
+                continue
+    return str(value) if value else None
+
+
+def normalize_epc_data(epc_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Normaliseer EPC-velden: datums YYYY-MM-DD, getallen als getal, strings getrimd."""
+    if not epc_data or epc_data.get('error'):
+        return epc_data
+    out = {}
+    for k, v in epc_data.items():
+        if v is None:
+            out[k] = None
+            continue
+        if k in _EPC_DATE_KEYS:
+            out[k] = _normalize_epc_date(v)
+        elif k in _EPC_NUMERIC_KEYS:
+            if isinstance(v, (int, float)):
+                out[k] = v
+            elif isinstance(v, str):
+                v = v.strip().replace(",", ".")
+                try:
+                    out[k] = int(v) if "." not in v and "e" not in v.lower() else float(v)
+                except (ValueError, TypeError):
+                    out[k] = None
+            else:
+                out[k] = None
+        elif k in _EPC_BOOL_KEYS:
+            if isinstance(v, bool):
+                out[k] = v
+            elif isinstance(v, str):
+                out[k] = v.strip().lower() in ('true', 'ja', 'yes', '1', 'x')
+            else:
+                out[k] = bool(v) if v is not None else None
+        elif isinstance(v, str):
+            out[k] = v.strip() or None
+        elif isinstance(v, list):
+            out[k] = [x.strip() if isinstance(x, str) else x for x in v] if v else []
+        else:
+            out[k] = v
+    return out
+
+
+def calculate_confidence_epc(epc_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Confidence voor EPC (voor ordening): kritieke velden zwaarder."""
+    critical = {
+        'adres': epc_data.get('adres'),
+        'energieklasse': epc_data.get('energieklasse'),
+        'vloeroppervlakte_m2': epc_data.get('vloeroppervlakte_m2') or epc_data.get('oppervlakte'),
+        'geldig_tot': epc_data.get('geldig_tot'),
+    }
+    filled_critical = sum(1 for v in critical.values() if v is not None and v != '')
+    critical_score = (filled_critical / len(critical)) * 50  # 50 punten max
+    filled = sum(1 for v in epc_data.values() if v is not None and v != '' and v != [] and v != {})
+    total = len(epc_data)
+    completeness = (filled / total * 50) if total else 0  # 50 punten max
+    score = min(100, round(critical_score + completeness))
+    details = {}
+    if filled_critical < len(critical):
+        missing = [k for k, v in critical.items() if not v or v == '']
+        details['missing_critical'] = missing
+    return {"score": score, "details": details}
+
+
+def extract_epc_document(full_text: str, gemini_client, model, extract_key_idx: Optional[int] = None) -> Dict[str, Any]:
+    """Extraheer EPC/EPB-velden uit een energieprestatiecertificaat. Retourneert dict of {'error': '...'}."""
+    text_chunk_1 = full_text[:TEXT_CHUNK_1_SIZE]
+    text_chunk_2 = full_text[TEXT_CHUNK_OVERLAP:TEXT_CHUNK_2_SIZE] if len(full_text) > TEXT_CHUNK_OVERLAP else ""
+    prompt = PROMPT_EPC.format(text_chunk_1=text_chunk_1, text_chunk_2=text_chunk_2)
+    for attempt in range(3):
+        try:
+            response = gemini_client.models.generate_content(
+                model=model,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    temperature=0.1,
+                    response_mime_type="application/json",
+                ),
+            )
+            raw = response.text.strip()
+            if raw.startswith("```"):
+                raw = raw.split("```")[1]
+                if raw.startswith("json"):
+                    raw = raw[4:]
+                raw = raw.strip()
+            data = json.loads(raw)
+            if extract_key_idx is not None:
+                record_extract_use(extract_key_idx)
+            return data
+        except json.JSONDecodeError:
+            if attempt < 2:
+                time.sleep(3)
+            else:
+                return {"error": "EPC_JSON_PARSE_FAILED"}
+        except Exception as e:
+            err = str(e)
+            if is_quota_error(err):
+                return {"error": "QUOTA_EXCEEDED", "details": err}
+            if is_api_key_error(err):
+                return {"error": "API_KEY_ERROR", "details": err}
+            if attempt < 2:
+                time.sleep(RETRY_WAIT)
+            else:
+                return {"error": "EPC_EXTRACT_FAILED", "details": err}
+    return {"error": "EPC_EXTRACT_FAILED"}
+
+
+def extract_contract_data(full_text, gemini_client, model, initial_data: Optional[Dict[str, dict]] = None, pages_text: Optional[List[Tuple[int, str]]] = None, extract_key_idx: Optional[int] = None, all_words: Optional[List[Dict[str, Any]]] = None, words_by_page: Optional[Dict[int, List[Dict[str, Any]]]] = None):
     """
     Multi-stage huurcontract extractor. Stap 4+5: eerst regels (initial_data), dan AI voor ontbrekende secties.
     pages_text: optional list of (1-based page number, page text) for adding source_page to source_quote fields.
+    all_words/words_by_page: optional word-level data for numbered prompt and word_ids in response.
     """
     if initial_data is None:
         initial_data = try_regex_contract_fields(full_text)
@@ -2245,11 +2515,19 @@ def extract_contract_data(full_text, gemini_client, model, initial_data: Optiona
     text_chunk_1 = full_text[:TEXT_CHUNK_1_SIZE]
     text_chunk_2 = full_text[TEXT_CHUNK_OVERLAP:TEXT_CHUNK_2_SIZE] if len(full_text) > TEXT_CHUNK_OVERLAP else ""
 
+    # Genummerde tekst voor word_ids (exacte PDF-markering)
+    numbered_suffix = ""
+    if all_words and len(all_words) > 0:
+        numbered_chunk = build_numbered_prompt(all_words, TEXT_CHUNK_1_SIZE)
+        if numbered_chunk:
+            numbered_suffix = "\n\n" + WORD_IDS_INSTRUCTION + "\n\nGENUMBERDE TEKST (gebruik de [getal]-IDs voor word_ids):\n" + numbered_chunk
+            print(f"   📌 Word IDs: {len(all_words)} woorden in prompt voor exacte markering")
+
     print("   🎯 Starting extraction (regels + AI voor ontbrekende velden)...")
 
     extracted_sections = {}
 
-    _sq = SOURCE_QUOTE_INSTRUCTION
+    _sq = SOURCE_QUOTE_INSTRUCTION + numbered_suffix
     _ctx2_6k = text_chunk_2[:6000] if text_chunk_2 else ""
     _ctx2_5k = text_chunk_2[:5000] if text_chunk_2 else ""
 
@@ -2394,7 +2672,7 @@ def extract_contract_data(full_text, gemini_client, model, initial_data: Optiona
     def count_fields(obj):
         nonlocal total_fields, filled_fields
         if isinstance(obj, dict):
-            if "value" in obj and not any(k not in ("value", "source_quote", "source_page") for k in obj):
+            if "value" in obj and not any(k not in ("value", "source_quote", "source_page", "word_ids") for k in obj):
                 total_fields += 1
                 w = obj.get("value")
                 if w is not None and w != "" and w != []:
@@ -2456,7 +2734,7 @@ def calculate_confidence_normalized(normalized_data: dict, full_text: str,
         total = 0
         filled = 0
         if isinstance(obj, dict):
-            if "value" in obj and not any(k not in ("value", "source_quote", "source_page") for k in obj):
+            if "value" in obj and not any(k not in ("value", "source_quote", "source_page", "word_ids") for k in obj):
                 total += 1
                 v = obj.get("value")
                 if v is not None and v != "" and v != [] and v != {}:
@@ -2487,7 +2765,7 @@ def calculate_confidence_normalized(normalized_data: dict, full_text: str,
         total_leaf = 0
         with_quote = 0
         if isinstance(obj, dict):
-            if "value" in obj and not any(k not in ("value", "source_quote", "source_page") for k in obj):
+            if "value" in obj and not any(k not in ("value", "source_quote", "source_page", "word_ids") for k in obj):
                 total_leaf += 1
                 if obj.get("source_quote"):
                     with_quote += 1
@@ -2516,11 +2794,8 @@ def calculate_confidence_normalized(normalized_data: dict, full_text: str,
     else:
         score += 5
 
-    # Normalize score
+    # Normalize score (voor ordening; geen drempel meer)
     score = max(0, min(100, round(score, 1)))
-
-    # Determine if review needed
-    needs_review = score < TARGET_CONFIDENCE or len(issues) > 0
 
     # Build details string
     details_parts = []
@@ -2535,7 +2810,6 @@ def calculate_confidence_normalized(normalized_data: dict, full_text: str,
 
     return {
         'score': score,
-        'needs_review': needs_review,
         'issues': issues,
         'warnings': warnings,
         'details': "\n\n".join(details_parts),
@@ -2612,10 +2886,11 @@ def generate_summary(full_text: str, doc_type: str, gemini_client, model, extrac
 
 def process_rental_contract(clients, pdf_info):
     """Process and analyze a rental contract. Gebruikt rotator: 12 extract-keys (KEY_9..20), max 18/24u per key."""
-
+    start_time = time.time()
     dbx_analyze = clients['dbx_analyze']
     dbx_target = clients['dbx_target']
     model = clients['model_analyze']
+    model_name = getattr(model, "name", str(model)) if model else ""
 
     # Volgende extract-key (KEY_9..20); 1 key per contract
     api_key, key_idx = get_next_extract_key()
@@ -2640,8 +2915,6 @@ def process_rental_contract(clients, pdf_info):
         print(f"📂 Location: {pdf_info['folder']}")
         print(f"{'='*70}")
 
-        start_time = time.time()
-
         # Download and extract text WITH OCR fallback
         print(f"⬇️  Downloading...")
         _, response = dbx_analyze.files_download(pdf_info['path'])
@@ -2655,77 +2928,108 @@ def process_rental_contract(clients, pdf_info):
             print(f"⚠️  Too little text - skipping")
             return None
 
-        # Extract raw data
-        print("🤖 Gemini analyzing contract...")
-        contract_data = extract_contract_data(full_text, gemini, model, pages_text=pages_text, extract_key_idx=key_idx)
+        doc_type = get_document_type_from_path_and_name(pdf_info.get('path') or '', pdf_info.get('name') or '')
+        if doc_type == 'epc':
+            print("🤖 Gemini analyzing EPC document...")
+            epc_data = extract_epc_document(full_text, gemini, model, extract_key_idx=key_idx)
+            if epc_data.get('error') == 'QUOTA_EXCEEDED':
+                remove_from_history(ANALYZED_HISTORY, pdf_info['path'])
+                return {'quota_error': True, 'requeue': True}
+            if epc_data.get('error') == 'API_KEY_ERROR':
+                remove_from_history(ANALYZED_HISTORY, pdf_info['path'])
+                return {'api_key_error': True, 'requeue': True}
+            if epc_data.get('error'):
+                print(f"❌ EPC extractie mislukt: {epc_data.get('error')}")
+                return None
+            epc_data = normalize_epc_data(epc_data)
+            adres = epc_data.get('adres') or ''
+            normalized_data = {
+                "pand": {"adres": adres},
+                "epc_document": epc_data,
+            }
+            confidence = calculate_confidence_epc(epc_data)
+            klasse = epc_data.get('energieklasse') or '—'
+            opp = epc_data.get('vloeroppervlakte_m2') or epc_data.get('oppervlakte')
+            geldig = epc_data.get('geldig_tot') or '—'
+            summary = f"EPC: energieklasse {klasse}, oppervlakte {opp} m², geldig tot {geldig}. {epc_data.get('verkoop_argument_energie') or ''}".strip()
+            processing_time = time.time() - start_time
+            print(f"✓ EPC verwerkt in {processing_time:.1f}s - Score: {confidence['score']}%")
+            result = {
+                "success": True,
+                "filename": pdf_info['name'],
+                "title": "EPC",
+                "type_verified": True,
+                "full_text": full_text,
+                "raw_data": epc_data,
+                "normalized_data": normalized_data,
+                "summary": summary,
+                "confidence": confidence,
+                "processing_time": processing_time,
+                "words_by_page": None,
+            }
+        else:
+            # Word-level extraction for position-based PDF highlight (only when text came from text layer)
+            words_by_page = {}
+            all_words = []
+            if pdf_metadata.get("extraction_method") == "text" and response.content:
+                try:
+                    words_by_page, all_words = extract_words_with_ids(response.content)
+                except Exception as we:
+                    logger.warning(f"Word extraction skipped: {we}")
 
-        if contract_data.get('error') == 'QUOTA_EXCEEDED':
-            print(f"❌ QUOTA EXCEEDED - requeuing document for retry")
-            # Remove from history so it will be retried later
-            remove_from_history(ANALYZED_HISTORY, pdf_info['path'])
-            return {'quota_error': True, 'requeue': True}
-        
-        if contract_data.get('error') == 'API_KEY_ERROR':
-            print(f"❌ API KEY ERROR - requeuing document for retry")
-            print(f"   Details: {contract_data.get('details', 'Unknown API key error')}")
-            # Remove from history so it will be retried when API key is fixed
-            remove_from_history(ANALYZED_HISTORY, pdf_info['path'])
-            return {'api_key_error': True, 'requeue': True}
+            # Extract raw data (huurcontract)
+            print("🤖 Gemini analyzing contract...")
+            contract_data = extract_contract_data(
+                full_text, gemini, model,
+                pages_text=pages_text,
+                extract_key_idx=key_idx,
+                all_words=all_words if all_words else None,
+                words_by_page=words_by_page if words_by_page else None,
+            )
 
-        # Normalize data
-        normalized_data = normalizer.normalize(contract_data)
+            if contract_data.get('error') == 'QUOTA_EXCEEDED':
+                print(f"❌ QUOTA EXCEEDED - requeuing document for retry")
+                remove_from_history(ANALYZED_HISTORY, pdf_info['path'])
+                return {'quota_error': True, 'requeue': True}
+            if contract_data.get('error') == 'API_KEY_ERROR':
+                print(f"❌ API KEY ERROR - requeuing document for retry")
+                remove_from_history(ANALYZED_HISTORY, pdf_info['path'])
+                return {'api_key_error': True, 'requeue': True}
 
-        # Calculate confidence
-        confidence = calculate_confidence_normalized(normalized_data, full_text,
-                                                     "huurovereenkomst", True)
+            normalized_data = normalizer.normalize(contract_data)
+            confidence = calculate_confidence_normalized(normalized_data, full_text, "huurovereenkomst", True)
+            summary = generate_summary(full_text, "huurovereenkomst", gemini, model, extract_key_idx=key_idx)
 
-        # Generate summary
-        summary = generate_summary(full_text, "huurovereenkomst", gemini, model, extract_key_idx=key_idx)
+            if "QUOTA_EXCEEDED" in summary:
+                remove_from_history(ANALYZED_HISTORY, pdf_info['path'])
+                return {'quota_error': True, 'requeue': True}
+            if "API_KEY_ERROR" in summary or is_api_key_error(summary):
+                remove_from_history(ANALYZED_HISTORY, pdf_info['path'])
+                return {'api_key_error': True, 'requeue': True}
 
-        if "QUOTA_EXCEEDED" in summary:
-            print(f"❌ QUOTA EXCEEDED - requeuing document for retry")
-            # Remove from history so it will be retried later
-            remove_from_history(ANALYZED_HISTORY, pdf_info['path'])
-            return {'quota_error': True, 'requeue': True}
-        
-        if "API_KEY_ERROR" in summary or is_api_key_error(summary):
-            print(f"❌ API KEY ERROR in summary - requeuing document for retry")
-            # Remove from history so it will be retried when API key is fixed
-            remove_from_history(ANALYZED_HISTORY, pdf_info['path'])
-            return {'api_key_error': True, 'requeue': True}
-
-        processing_time = time.time() - start_time
-
-        print(f"✓ Processed in {processing_time:.1f}s - Score: {confidence['score']}%")
-
-        result = {
-            "success": True,
-            "filename": pdf_info['name'],
-            "title": "Huurovereenkomst",
-            "type_verified": True,
-            "full_text": full_text,
-            "raw_data": contract_data,
-            "normalized_data": normalized_data,
-            "summary": summary,
-            "confidence": confidence,
-            "processing_time": processing_time
-        }
+            processing_time = time.time() - start_time
+            print(f"✓ Processed in {processing_time:.1f}s - Score: {confidence['score']}%")
+            result = {
+                "success": True,
+                "filename": pdf_info['name'],
+                "title": "Huurovereenkomst",
+                "type_verified": True,
+                "full_text": full_text,
+                "raw_data": contract_data,
+                "normalized_data": normalized_data,
+                "summary": summary,
+                "confidence": confidence,
+                "processing_time": processing_time,
+                "words_by_page": words_by_page if words_by_page else None,
+            }
 
         # Save JSON to TARGET
         ts = datetime.now().strftime('%Y%m%d_%H%M%S')
         base = pdf_info['name'].replace('.pdf', '')
-
         path_upper = (pdf_info.get('path') or '').upper().replace('\\', '/')
-        if '/EPC/' in path_upper or path_upper.rstrip('/').endswith('/EPC'):
-            doc_type = 'epc'
-        elif '/ASBEST/' in path_upper or path_upper.rstrip('/').endswith('/ASBEST'):
-            doc_type = 'asbest'
-        elif '/KADASTER/' in path_upper or path_upper.rstrip('/').endswith('/KADASTER') or '/EIGENDOMSTITEL/' in path_upper:
-            doc_type = 'kadaster'
-        else:
-            doc_type = 'huurcontract'
 
-        # Voor EPC/kadaster/asbest: als pand.adres ontbreekt, afleiden uit mappad (bv. .../Beukenhof_14B/EPC/file.pdf → Beukenhof 14B)
+        # Voor EPC/kadaster/asbest: als pand.adres ontbreekt, afleiden uit mappad
+        # Oude structuur: .../Type/Adres/file.pdf (Adres = segment vóór EPC/ASBEST). Nieuwe: .../Provincie/Adres/file.pdf (Adres = laatste map).
         if doc_type in ('epc', 'kadaster', 'asbest'):
             pand = normalized_data.get('pand') or {}
             if not isinstance(pand, dict):
@@ -2735,12 +3039,15 @@ def process_rental_contract(clients, pdf_info):
             if not adres_val or (isinstance(adres_val, str) and not adres_val.strip()):
                 path_str = (pdf_info.get('path') or '').replace('\\', '/').strip('/')
                 parts = [p for p in path_str.split('/') if p]
-                sub_names = ('EPC', 'ASBEST', 'KADASTER', 'EIGENDOMSTITEL')
                 adres_folder = None
+                sub_names = ('EPC', 'ASBEST', 'KADASTER', 'EIGENDOMSTITEL')
                 for i, seg in enumerate(parts):
                     if seg.upper() in sub_names and i > 0:
                         adres_folder = parts[i - 1]
                         break
+                if not adres_folder and len(parts) >= 2:
+                    # Nieuwe structuur: /Contracten/Provincie/Adres/file.pdf → laatste map = Adres
+                    adres_folder = parts[-2] if not parts[-1].lower().endswith('.pdf') else parts[-2]
                 if adres_folder:
                     derived_adres = adres_folder.replace('_', ' ').strip()
                     if derived_adres:
@@ -2758,6 +3065,10 @@ def process_rental_contract(clients, pdf_info):
 
         if "raw_data" in result and "error" not in result['raw_data']:
             json_data["raw_data"] = result['raw_data']
+
+        # Words per page for exact PDF highlight in frontend (word_ids in contract_data)
+        if result.get("words_by_page"):
+            json_data["words_by_page"] = result["words_by_page"]
 
         json_name = f"data_{base}_{ts}.json"
         json_file = f"/{json_name}"
@@ -2794,95 +3105,27 @@ def process_rental_contract(clients, pdf_info):
             print(f"❌ Supabase save failed — JSON niet opgeslagen")
             raise
 
-        # Auto-push to Whise if confidence >= 95%
-        conf = confidence  # Define conf variable for consistency
-        if conf['score'] >= 95:
-            try:
-                print(f"🚀 Auto-pushing to Whise (confidence: {conf['score']}%)...")
-                
-                # Get Whise API credentials from environment
-                whise_api_endpoint = os.getenv('WHISE_API_ENDPOINT')
-                whise_api_token = os.getenv('WHISE_API_TOKEN')
-                
-                if whise_api_endpoint and whise_api_token:
-                    # Prepare Whise payload
-                    whise_payload = {
-                        'property_id': normalized_data.get('pand', {}).get('adres') or pdf_info['name'],
-                        'contract_data': {
-                            'huurprijs': normalized_data.get('financieel', {}).get('huurprijs'),
-                            'adres': normalized_data.get('pand', {}).get('adres'),
-                            'type': normalized_data.get('pand', {}).get('type'),
-                            'oppervlakte': normalized_data.get('pand', {}).get('oppervlakte'),
-                            'verhuurder': normalized_data.get('partijen', {}).get('verhuurder', {}).get('naam'),
-                            'huurder': normalized_data.get('partijen', {}).get('huurder', {}).get('naam'),
-                            'ingangsdatum': normalized_data.get('periodes', {}).get('ingangsdatum'),
-                            'einddatum': normalized_data.get('periodes', {}).get('einddatum'),
-                        },
-                        'metadata': {
-                            'filename': pdf_info['name'],
-                            'confidence': conf['score'],
-                            'processed': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                            'source': 'contract-system-auto'
-                        }
-                    }
-                    
-                    # Make HTTP POST request to Whise API
-                    try:
-                        import requests
-                    except ImportError:
-                        raise ImportError("'requests' library is required for Whise API. Install with: pip install requests")
-                    
-                    response = requests.post(
-                        whise_api_endpoint,
-                        headers={
-                            'Authorization': f'Bearer {whise_api_token}',
-                            'Content-Type': 'application/json'
-                        },
-                        json=whise_payload,
-                        timeout=30
-                    )
-                    
-                    if response.status_code == 200 or response.status_code == 201:
-                        whise_result = response.json()
-                        logger.info(f"✅ Successfully auto-pushed to Whise: {json_file} (Whise ID: {whise_result.get('id', 'N/A')})")
-                        print(f"✅ Automatisch gepusht naar Whise (ID: {whise_result.get('id', 'N/A')})")
-                        
-                        # Add whise_pushed flag to JSON data
-                        json_data['whise_pushed'] = True
-                        json_data['whise_id'] = whise_result.get('id')
-                        json_data['whise_pushed_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-
-                        # Update JSON with Whise metadata (alleen Supabase)
-                        try:
-                            supabase_update_contract_data(supabase_config, json_name, json_data)
-                        except Exception as e:
-                            logger.warning(f"Supabase update after Whise push failed: {e}")
-                    else:
-                        error_text = response.text
-                        logger.warning(f"⚠️  Whise API returned error: {response.status_code} - {error_text}")
-                        print(f"⚠️  Whise push failed: {response.status_code} - {error_text}")
-                else:
-                    logger.info(f"ℹ️  Whise API not configured (confidence: {conf['score']}%)")
-                    print(f"ℹ️  Whise API niet geconfigureerd - contract is klaar voor push (confidence: {conf['score']}%)")
-                    
-            except ImportError:
-                logger.warning("⚠️  'requests' library not installed. Install with: pip install requests")
-                print("⚠️  'requests' library niet geïnstalleerd. Installeer met: pip install requests")
-            except Exception as e:
-                logger.warning(f"Failed to auto-push to Whise: {e}")
-                print(f"⚠️  Auto-push naar Whise mislukt: {e}")
-
         # Log to CSV (Dropbox TARGET blijft voor CSV)
         log_to_csv(dbx_target, pdf_info['name'], result, json_name, "success")
+        log_api_performance(
+            "extract",
+            pdf_info['name'],
+            result.get('processing_time', 0),
+            True,
+            document_type=result.get('title'),
+            model=model_name,
+            key_index=key_idx,
+            extraction_method=pdf_metadata.get('extraction_method'),
+        )
 
         # Send email - alleen als verwerking succesvol was
-        # Add key contract details
+        # Add key contract details (unwrap value/source_quote dicts voor weergave)
         normalized = result['normalized_data']
         details_section = ""
 
         if normalized.get('partijen'):
-            verhuurder = normalized['partijen'].get('verhuurder', {}).get('naam', 'N/A')
-            huurder = normalized['partijen'].get('huurder', {}).get('naam', 'N/A')
+            verhuurder = _unwrap_field_value(normalized['partijen'].get('verhuurder', {}).get('naam')) or 'N/A'
+            huurder = _unwrap_field_value(normalized['partijen'].get('huurder', {}).get('naam')) or 'N/A'
             details_section += f"""
 PARTIES
 Landlord: {verhuurder}
@@ -2890,27 +3133,35 @@ Tenant: {huurder}
 """
 
         if normalized.get('pand'):
-            adres = normalized['pand'].get('adres', 'N/A')
+            adres = _unwrap_field_value(normalized['pand'].get('adres')) or 'N/A'
             details_section += f"""
 PROPERTY
 Address: {adres}
 """
 
         if normalized.get('financieel'):
-            huurprijs = normalized['financieel'].get('huurprijs')
-            waarborg = normalized['financieel'].get('waarborg', {}).get('bedrag')
-            if huurprijs or waarborg:
+            huurprijs_raw = normalized['financieel'].get('huurprijs')
+            waarborg_raw = normalized['financieel'].get('waarborg', {}).get('bedrag')
+            huurprijs = _unwrap_field_value(huurprijs_raw)
+            waarborg = _unwrap_field_value(waarborg_raw)
+            if huurprijs is not None or waarborg is not None:
                 details_section += f"""
 FINANCIAL"""
-                if huurprijs:
-                    details_section += f"\nRent: €{huurprijs:.2f}/month"
-                if waarborg:
-                    details_section += f"\nDeposit: €{waarborg:.2f}"
+                if huurprijs is not None and huurprijs != '':
+                    try:
+                        details_section += f"\nRent: €{float(huurprijs):.2f}/month"
+                    except (TypeError, ValueError):
+                        details_section += f"\nRent: {huurprijs}/month"
+                if waarborg is not None and waarborg != '':
+                    try:
+                        details_section += f"\nDeposit: €{float(waarborg):.2f}"
+                    except (TypeError, ValueError):
+                        details_section += f"\nDeposit: {waarborg}"
                 details_section += "\n"
 
         if normalized.get('periodes'):
-            start = normalized['periodes'].get('ingangsdatum', 'N/A')
-            duur = normalized['periodes'].get('duur', 'N/A')
+            start = _unwrap_field_value(normalized['periodes'].get('ingangsdatum')) or 'N/A'
+            duur = _unwrap_field_value(normalized['periodes'].get('duur')) or 'N/A'
             details_section += f"""
 PERIOD
 Start Date: {start}
@@ -2932,17 +3183,21 @@ Duration: {duur}
             image_path = EMAIL_IMAGE_PATH if os.path.isabs(EMAIL_IMAGE_PATH) else os.path.join(_script_dir, EMAIL_IMAGE_PATH)
         send_email(subject, email_body, image_path=image_path)
 
-        if result['confidence']['needs_review']:
-            print("⚠️  Review required")
-        else:
-            print("✅ Approved")
-
         return result
 
     except Exception as e:
         error_msg = str(e)
         print(f"❌ Processing error: {error_msg}")
-        
+        log_api_performance(
+            "extract",
+            pdf_info['name'],
+            time.time() - start_time,
+            False,
+            document_type=get_document_type_from_path_and_name(pdf_info.get('path') or '', pdf_info.get('name') or ''),
+            error=error_msg,
+            model=model_name,
+            key_index=key_idx,
+        )
         # Check if it's an API key error
         if is_api_key_error(error_msg):
             print(f"   🔄 API Key error detected - requeuing document for retry")
@@ -2962,16 +3217,16 @@ Duration: {duur}
 
 
 # ============================================================================
-# PHASE 2: ANALYZE RENTAL CONTRACTS
+# PHASE 2: ANALYZE CONTRACTS (huur, EPC, asbest, kadaster, …)
 # ============================================================================
 
 def analyze_rental_contracts(clients, analyzed_history):
-    """Find and analyze all rental contracts"""
+    """Find and analyze all contract documents (huur, EPC, asbest, kadaster) under /Contracten/."""
 
     dbx_analyze = clients['dbx_analyze']
 
     print(f"\n{'='*70}")
-    print(f"🔍 PHASE 2: ANALYZING RENTAL CONTRACTS")
+    print(f"🔍 PHASE 2: ANALYZING CONTRACTS (huur, EPC, asbest, …)")
     print(f"{'='*70}")
 
     # DEBUG: Show what's in history
@@ -2981,28 +3236,25 @@ def analyze_rental_contracts(clients, analyzed_history):
         for path in list(analyzed_history)[:3]:
             print(f"   - {path}")
 
-    # Find rental contract folders
-    print("📁 Scanning for rental contract folders...")
-    rental_folders = find_rental_contract_folders(dbx_analyze)
+    # Find all contract folders (onder /Contracten/) die PDFs bevatten
+    print("📁 Scanning for contract folders (huur, EPC, asbest, …)...")
+    contract_folders = find_contract_folders_with_pdfs(dbx_analyze)
 
-    if not rental_folders:
-        print("ℹ️  No rental contract folders found")
-        print(f"   Tip: Folders moeten keywords bevatten: {', '.join(RENTAL_KEYWORDS)}")
+    if not contract_folders:
+        print("ℹ️  No contract folders with PDFs found under /Contracten/")
         return 0
 
-    print(f"✓ Found {len(rental_folders)} rental folder(s):")
-    for folder in rental_folders:
-        print(f"   - {folder}")
+    print(f"✓ Found {len(contract_folders)} folder(s) with PDFs")
 
     # Find PDFs in these folders
-    print("\n📄 Finding PDFs in rental folders...")
-    all_pdfs = find_pdfs_in_folders(dbx_analyze, rental_folders)
+    print("\n📄 Finding PDFs in contract folders...")
+    all_pdfs = find_pdfs_in_folders(dbx_analyze, contract_folders)
 
     if not all_pdfs:
-        print("ℹ️  No PDFs found in rental folders")
+        print("ℹ️  No PDFs found in contract folders")
         return 0
 
-    print(f"✓ Found {len(all_pdfs)} PDF(s) in rental folders")
+    print(f"✓ Found {len(all_pdfs)} PDF(s) (huur, EPC, asbest, …)")
 
     # DEBUG: Show all PDF paths
     print(f"\n📝 All PDF paths found:")

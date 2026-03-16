@@ -54,12 +54,13 @@ REGELS
    - Twijfel of onduidelijk → /Overig
 
 2. CONTRACTEN (huur, EPC, asbest, eigendomstitel, koop, …):
-   - folder_path = /Contracten/[TypeMap]/[Adres]
-   - TypeMap = Huurcontracten, EPC, Asbest, Eigendomstitel, Koopcontracten.
-   - Adres = straat + nummer uit de tekst (bv. Kerkstraat_10, Meir_78_bus_3). Alleen bij CONTRACTEN: als geen adres in tekst → Onbekend_adres.
-   - Zelfde adres + zelfde type: als die map al in EXISTING FOLDERS staat → action "existing", anders "new".
-   - suggested_filename = Adres_Type.pdf (bv. Kerkstraat_10_huurcontract.pdf, Meir_78_bus_3_EPC.pdf, Kerkstraat_10_asbest.pdf).
-   Voorbeelden: /Contracten/Huurcontracten/Kerkstraat_10, /Contracten/EPC/Meir_78_bus_3, /Contracten/Asbest/Kerkstraat_10, /Contracten/Eigendomstitel/Onbekend_adres.
+   - folder_path = /Contracten/[Provincie]/[Adres]
+   - Eén map per PAND: alle documenten van hetzelfde adres (huur, EPC, asbest, …) komen in dezelfde map.
+   - Provincie = Belgische provincie op basis van adres/postcode in het document. Gebruik exact: Antwerpen, Limburg, Oost-Vlaanderen, Vlaams-Brabant, West-Vlaanderen, Brussel, Waals-Brabant, Henegouwen, Luik, Luxemburg, Namen. Geen spaties in mapnaam (bv. Oost-Vlaanderen).
+   - Adres = straat + nummer uit de tekst (bv. Kerkstraat_10, Meir_78_bus_3). Geen adres in tekst → Onbekend_adres.
+   - Zelfde provincie + zelfde adres: als die map al in EXISTING FOLDERS staat → action "existing", anders "new".
+   - suggested_filename = Adres_Type.pdf (bv. Kerkstraat_10_huurcontract.pdf, Meir_78_bus_3_EPC.pdf, Kerkstraat_10_asbest.pdf) zodat huur en EPC van hetzelfde pand in dezelfde map staan.
+   Voorbeelden: /Contracten/Antwerpen/Kerkstraat_10, /Contracten/Antwerpen/Meir_78_bus_3, /Contracten/Oost-Vlaanderen/Onbekend_adres.
 
 3. NIET-CONTRACTEN (verhaal, certificaat, verklaring, onderwijs, factuur, …):
    - Verhaal/essay/narratief → folder_path = /Verhaal. Certificaat/verklaring/studentenverklaring → folder_path = /Onderwijs. NOOIT /Onbekend_adres.
@@ -77,32 +78,32 @@ VERPLICHT: Geef ALTIJD action, folder_path, confidence (0-100), reasoning, sugge
 
 ANTWOORD FORMAT (ALLEEN JSON, geen tekst ervoor/erna):
 
-Voorbeeld CONTRACT (huurcontract Kerkstraat 10, map bestaat al):
+Voorbeeld CONTRACT (huurcontract Kerkstraat 10 Antwerpen, map bestaat al):
 {{
   "action": "existing",
-  "folder_path": "/Contracten/Huurcontracten/Kerkstraat_10",
+  "folder_path": "/Contracten/Antwerpen/Kerkstraat_10",
   "confidence": 95,
-  "reasoning": "Huurcontract voor Kerkstraat 10; map /Contracten/Huurcontracten/Kerkstraat_10 bestaat al.",
+  "reasoning": "Huurcontract voor Kerkstraat 10 (Antwerpen); map /Contracten/Antwerpen/Kerkstraat_10 bestaat al.",
   "suggested_filename": "Kerkstraat_10_huurcontract.pdf",
   "summary": "Huurcontract tussen verhuurder X en huurder Y voor Kerkstraat 10. Looptijd 3 jaar, huurprijs 850 euro. Waarborg twee maanden."
 }}
 
-Voorbeeld CONTRACT (EPC Meir 78 bus 3, nieuwe map):
+Voorbeeld CONTRACT (EPC Meir 78 bus 3 Antwerpen, zelfde pand als huur):
 {{
-  "action": "new",
-  "folder_path": "/Contracten/EPC/Meir_78_bus_3",
+  "action": "existing",
+  "folder_path": "/Contracten/Antwerpen/Meir_78_bus_3",
   "confidence": 98,
-  "reasoning": "Energieprestatiecertificaat voor Meir 78 bus 3; map bestaat nog niet.",
+  "reasoning": "EPC voor Meir 78 bus 3 (Antwerpen); map voor dit pand bestaat al (huur staat er al).",
   "suggested_filename": "Meir_78_bus_3_EPC.pdf",
   "summary": "EPC voor Meir 78 bus 3. Energielabel C. Bewoonbare oppervlakte 95 m². Geldig tot 2030."
 }}
 
-Voorbeeld CONTRACT (Asbestattest Kerkstraat 10):
+Voorbeeld CONTRACT (Asbestattest Kerkstraat 10, zelfde map als huur):
 {{
-  "action": "new",
-  "folder_path": "/Contracten/Asbest/Kerkstraat_10",
+  "action": "existing",
+  "folder_path": "/Contracten/Antwerpen/Kerkstraat_10",
   "confidence": 95,
-  "reasoning": "Asbestattest / asbestvrijverklaring voor Kerkstraat 10.",
+  "reasoning": "Asbestattest voor Kerkstraat 10; map /Contracten/Antwerpen/Kerkstraat_10 bestaat al.",
   "suggested_filename": "Kerkstraat_10_asbest.pdf",
   "summary": "Asbestattest voor Kerkstraat 10. Pand asbestvrij verklaard. Datum attest vermeld."
 }}
@@ -147,6 +148,11 @@ JSON:"""
 
 SOURCE_QUOTE_INSTRUCTION = """
 BRON PER VELD: Voor elk veld dat je invult: geef indien mogelijk een object met "value" en "source_quote" in plaats van alleen een string. "source_quote" = de EXACTE zin of frase uit het contract, letterlijk zoals het er staat (inclusief spaties, punten, komma's). Voorbeeld: "naam": {{ "value": "Jan Janssen", "source_quote": "De verhuurder is Jan Janssen." }}. Voor BEDRAGEN EN GETALLEN: behoud de notatie uit het document in "source_quote" (bv. "2.300", "€ 1.150,00") zodat we kunnen controleren; "value" mag je normaliseren. Als je de bron niet kunt aanwijzen, geef dan alleen de string (zoals nu).
+"""
+
+# When numbered text is included in the prompt, ask AI to also return word_ids for exact PDF highlight.
+WORD_IDS_INSTRUCTION = """
+WOORD-IDS: In de genummerde tekst hieronder heeft elk woord een [getal]. Voor elk veld dat je invult met een object (value + source_quote), voeg ook "word_ids" toe: een array van die getallen die exact dat woord/de woorden in de tekst aanwijzen. Voorbeeld: als "3000" overeenkomt met [45], geef "word_ids": [45]. Meerdere woorden: "word_ids": [44, 45, 46]. Alleen de IDs van de woorden die de waarde vormen; geen IDs van omliggende tekst.
 """
 
 PROMPT_PARTIJEN = """Je bent een expert in Belgische huurcontracten. 
@@ -198,8 +204,11 @@ TAAK: Extraheer ALLE informatie over het gehuurde pand. Deze data wordt gebruikt
 - Volledig adres: straat, nummer, bus, postcode, stad (exact zoals in document)
 - Type woning: appartement, huis, studio, duplex, enz.
 - Bewoonbare oppervlakte in m² (alleen getal, geen "m²")
-- Aantal kamers / slaapkamers
-- Verdieping (getal of "gelijkvloers", "kelder")
+- Aantal slaapkamers (JSON: aantal_kamers): zoek expliciet naar "slaapkamers" in het document (bv. in samenstelling: "4 slaapkamers, 2 badkamers"). Geef het getal dat bij slaapkamers hoort (bv. 4). Als niet vermeld → "ONTBREKEND" of null. Negeer andere getallen (badkamers, toiletten, artikels, datums).
+- Verdieping: getal dat de verdieping(situatie) van het gehuurde pand weergeeft.
+  * Als het contract één verdieping noemt (bv. "gelegen op de 2e verdieping", "gelijkvloers"): geef dat getal (0 = gelijkvloers/kelder, 1 = 1e, 2 = 2e, …).
+  * Als het contract de woning beschrijft als meerdere niveaus/delen (bv. "gelijkvloers + 1e verdiep + zolder", "gelijkvloers en kelder", "benedenverdiep, eerste verdieping en zolder"): tel die genoemde niveaus en geef dat aantal (bv. 3 of 2). Geen vaste lijst hardcoden — herken zulke opsommingen en tel ze.
+  * Negeer andere getallen (adres, artikels).
 - Eventueel: bouwjaar, staat van het pand
 
 ══════════════════════════════════════════════════════════════════════════════
@@ -242,6 +251,7 @@ Deze velden samen vormen het "overzicht" per pand. Vul elk veld in dat je in de 
 BELANGRIJK (altijd toepassen):
 - Oppervlakte = alleen het getal (geen "m²", geen eenheid). Ook bewoonbare_oppervlakte_epc = getal.
 - Kadastraal inkomen = bedrag in euro, alleen het getal (geen €, geen eenheid).
+- aantal_kamers = aantal slaapkamers: zoek naar "slaapkamers" in de tekst en geef dat getal. Verdieping: bij opsomming van niveaus het aantal als getal. Geen losse getallen uit artikels of adressen.
 - Als iets NIET in de tekst vermeld staat → gebruik "ONTBREKEND" (string) of null voor optionele velden.
 - Kopieer exacte adressen zoals in het contract (geen afkortingen tenzij zo in document).
 
@@ -371,15 +381,16 @@ PROMPT_VOORWAARDEN = """Je bent een expert in Belgische huurcontracten.
 TAAK: Extraheer ALLE bijzondere voorwaarden en bepalingen.
 
 ZOEK SPECIFIEK NAAR:
-- Huisdieren toegestaan? (ja/nee/met toestemming)
+- Huisdieren: WAT staat er precies? (niet alleen ja/nee — bv. "honden niet, katten niet, vissen wel", "alleen kleine kooidieren", "met toestemming verhuurder")
 - Onderverhuur toegestaan? (ja/nee)
 - Werken/verbouwingen (wat mag/niet mag)
 - Andere bijzondere bepalingen
 
 BELANGRIJK:
-- huisdieren = true/false/"ONTBREKEND"
+- huisdieren_toelating = de VOLLEDIGE, LETTERLIJKE tekst uit het contract over huisdieren. Bijv. "Honden en katten zijn niet toegestaan. Vissen en kleine kooidieren zijn wel toegestaan." Of "Huisdieren zijn verboden." Geen samenvatting zoals alleen "ja" of "nee" — geef de exacte bewoording zodat duidelijk is wat wel/niet mag. Als er niets over huisdieren staat: "ONTBREKEND".
 - onderverhuur = true/false
 - werken = beschrijving in tekst
+- BRON EN MARKERING: Voor huisdieren_toelating MOET je source_quote en word_ids geven. source_quote = de exacte zin(nen) uit het contract over huisdieren (letterlijk overnemen). word_ids = de IDs van ALLE woorden van die passage in de genummerde tekst, zodat in de PDF precies die zin wordt gemarkeerd (gefluoriseerd). Wijs ALLEEN de zin over huisdieren aan, niet een andere zin met "toegestaan" of "verboden".
 
 CONTRACT TEKST:
 {text_chunk_1}
@@ -389,7 +400,7 @@ Extra context:
 
 VOORBEELD OUTPUT:
 {{
-  "huisdieren": true,
+  "huisdieren_toelating": {{ "value": "Honden en katten zijn niet toegestaan. Vissen en kleine kooidieren zijn wel toegestaan.", "source_quote": "Honden en katten zijn niet toegestaan. Vissen en kleine kooidieren zijn wel toegestaan.", "word_ids": [123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135] }},
   "onderverhuur": false,
   "werken": "Kleine herstellingswerken toegestaan. Grotere verbouwingen enkel met schriftelijke toestemming van verhuurder."
 }}
@@ -436,6 +447,86 @@ VOORBEELD OUTPUT:
 }}
 {source_quote_instruction}
 ALLEEN JSON:"""
+
+
+# =============================================================================
+# EPC-DOCUMENT (EPB-certificaat / energieprestatiecertificaat)
+# =============================================================================
+# Placeholder: text_chunk_1 (volledige tekst), eventueel text_chunk_2 voor extra context
+
+PROMPT_EPC = """Je bent een vastgoeddata-analist gespecialiseerd in Belgische EPB-certificaten (EPC).
+Analyseer het meegestuurde EPB-certificaat en geef ALLEEN een geldig JSON-object terug, zonder uitleg of markdown.
+
+REGELS (strikt volgen):
+- Gebruik ALLEEN waarden die expliciet in het document staan of die je exact kunt berekenen (bv. jaarlijkse kost uit verbruik × prijs). Bij twijfel of ontbreken: null.
+- Datums altijd in formaat YYYY-MM-DD. Getallen als getal (geen strings), behalve adres en vrije tekst.
+- Adres en energieklasse: letterlijk overnemen zoals op het certificaat (geen afkortingen tenzij zo vermeld).
+- Geen velden invullen met gokken of aannames. Liever null dan fout.
+
+Extraheer én BEREKEN (alleen indien in document of exact berekenbaar) de volgende velden:
+
+IDENTIFICATIE:
+- adres: volledig adres van het gebouw/eenheid (zoals op certificaat)
+- appartement_nr: appartementsnummer indien van toepassing
+- vloeroppervlakte_m2: bewoonbare oppervlakte in m² (getal)
+- volume_m3: volume indien vermeld (getal)
+- geldig_tot: einddatum geldigheid (YYYY-MM-DD)
+- afgeleverd_op: datum aflevering attest (YYYY-MM-DD)
+
+ENERGIEPRESTATIE:
+- energieklasse: A++, A+, A, B+, B, B-, C+, C, C-, D t/m G
+- epb_score: numerieke EPB-score indien vermeld
+- co2_uitstoot_kg_m2_jaar: CO₂-uitstoot in kg/m²/jaar
+- netto_energiebehoefte_verwarming: kWh/m²
+- primair_verbruik_per_m2: primair energieverbruik per m²
+- totaal_verbruik_jaar_kwh: totaal verbruik per jaar in kWh
+
+GESCHATTE ENERGIEKOST (bereken indien mogelijk):
+- geschatte_jaarlijkse_energiekost_eur: totaal kWh * ca. 0,30 EUR (gem. Belgische prijs)
+- geschatte_maandelijkse_energiekost_eur: jaarlijkse kost / 12, afgerond op 5 EUR
+- energiekost_label: "Zeer laag (<50€/mnd)" | "Laag (50-100€)" | "Gemiddeld (100-150€)" | "Hoog (150-250€)" | "Zeer hoog (>250€/mnd)"
+
+INSTALLATIES:
+- verwarmingssysteem: bv. "Warmtepomp", "Condenserende ketel"
+- verwarming_collectief: true/false
+- sanitair_warm_water: bv. "Condenserende ketel"
+- sww_collectief: true/false
+- ventilatie_type: A, B, C of D
+- hernieuwbare_energie: true indien zonnepanelen/warmtepomp/hernieuwbaar
+
+ISOLATIE & COMFORT:
+- u_waarde_venster: W/m².K (lager = beter)
+- u_waarde_opaque: W/m².K
+- luchtdichtheid_m3_h_m2: indien vermeld
+- oververhitting_risico: "Laag" | "Gemiddeld" | "Hoog"
+- ventilatie_conform: true/false
+
+EPB-CONFORMITEIT:
+- voldoet_nev: true indien netto energiebehoefte ≤ 15 kWh/m²
+- voldoet_primair_verbruik: true/false
+- voldoet_isolatie: true/false
+- aantal_niet_conform: aantal EPB-eisen die niet gehaald zijn (getal)
+
+SCORES (schaal 1-10, zelf inschatten op basis van certificaat):
+- score_energiezuinigheid: 10 = A++, 1 = G
+- score_comfort: o.b.v. ventilatie, oververhitting, luchtdichtheid
+- score_toekomstbestendigheid: hoog bij warmtepomp + hernieuwbaar + goede isolatie
+- score_totaal: gewogen gemiddelde (40% energiezuinig + 30% comfort + 30% toekomst)
+
+MATCHING:
+- profiel_tags: array van tags, kies uit: "Zeer energiezuinig", "Lage energiekost", "Warmtepomp", "Zonnepanelen", "Collectief systeem", "Instapklaar", "Renovatienodig", "Ideaal voor huurder", "Ideaal voor investeerder", "Toekomstbestendig", "Nieuwbouw kwaliteit"
+
+SAMENVATTING:
+- verkoop_argument_energie: max 2 zinnen voor makelaar (bv. "Energieklasse B+, geschatte energiekost €52/maand dankzij warmtepomp.")
+- aandachtspunten: array van zwakke punten (bv. "Ventilatie type C: minder comfortabel dan D")
+
+DOCUMENT TEKST (EPB-certificaat):
+{text_chunk_1}
+
+Extra context (indien nodig):
+{text_chunk_2}
+
+Geef ALLEEN het JSON-object. Alle sleutels aanwezig; gebruik null waar het veld ontbreekt of onzeker is. Geen tekst voor of na de JSON."""
 
 
 # =============================================================================

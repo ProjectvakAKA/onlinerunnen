@@ -1,0 +1,7 @@
+timestamp_iso,operation,document_type,filename,duration_sec,success,error,model,key_index,extraction_method
+"2026-03-16T21:13:45.746172","organize","","huurovereenkomst_01_peters_hasselt.pdf","47.67","1","","gemini-2.5-flash","1",""
+"2026-03-16T21:14:31.202688","extract","EPC","documents12.pdf","12.01","1","","gemini-2.5-flash","0","text"
+"2026-03-16T21:18:38.464494","extract","Huurovereenkomst","Havermarkt_7_bus_4_huurcontract.pdf","226.45","1","","gemini-2.5-flash","1","text"
+"2026-03-16T21:37:40.697124","organize","","202603161802212.pdf","13.45","1","","gemini-2.5-flash","4",""
+"2026-03-16T21:42:25.901089","organize","","202603161.pdf","12.17","1","","gemini-2.5-flash","6",""
+"2026-03-16T21:45:16.680035","extract","EPC","Kerkstraat_1_EPC.pdf","43.63","1","","gemini-2.5-flash","2","ocr_vision"
