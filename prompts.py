@@ -305,14 +305,18 @@ ZOEK SPECIFIEK NAAR:
 - Bank waar waarborg gedeponeerd is (naam + IBAN rekening)
 - Gemeenschappelijke kosten (wat is inbegrepen)
 - Privélasten (energie, water, gas, internet)
-- Indexatie (ja/nee)
+- Indexatie (ja/nee) en HOE dit geformuleerd is (bv. “jaarlijks op basis van de gezondheidsindex”)
 
 BELANGRIJK:
 - Huurprijs = alleen het getal (geen € teken)
 - Waarborg bedrag = alleen het getal
-- waar_gedeponeerd = "Banknaam (rekening BE12 3456 7890 1234)"
+- waar_gedeponeerd = "Banknaam — rekening BE12 3456 7890 1234" of "Banknaam (rekening BE12 3456 7890 1234)". BEHOUD ALLE leestekens zoals streepjes/dash (—, -), spaties en notatie EXACT zoals in het contract.
+- waar_gedeponeerd MOET een object zijn met value + source_quote (+ word_ids indien genummerde tekst aanwezig is). source_quote = de exacte regel uit het contract met banknaam + IBAN; word_ids = ALLE woord-IDs van die regel, zodat de juiste regel gefluoriseerd kan worden in de PDF.
 - kosten = beschrijving in tekst (wat inbegrepen, wat apart)
-- indexatie = true/false
+- indexatie = true/false. Mapping:
+  * Als er staat dat de huur jaarlijks/geperiodiseerd wordt geïndexeerd (bv. “jaarlijkse indexering”, “jaarlijks op basis van de gezondheidsindex”, “wordt geïndexeerd volgens de wet”) → indexatie = true.
+  * Als er expliciet staat dat er GEEN indexatie is (bv. “niet geïndexeerd”, “geen indexatie”, “indexering niet van toepassing”) → indexatie = false.
+  * Als er niets over indexatie staat → indexatie = false.
 
 CONTRACT TEKST:
 {text_chunk_1}
@@ -325,7 +329,11 @@ VOORBEELD OUTPUT:
   "huurprijs": 1150.0,
   "waarborg": {{
     "bedrag": 3450.0,
-    "waar_gedeponeerd": "Belfius Bank (rekening BE71 0961 2345 6769)"
+    "waar_gedeponeerd": {{
+      "value": "Triodos Bank — BE67 5230 8877 6655",
+      "source_quote": "Triodos Bank — BE67 5230 8877 6655",
+      "word_ids": [201, 202, 203, 204, 205, 206]
+    }}
   }},
   "kosten": "Gemeenschappelijke kosten (verwarming, water, lift) zijn inbegrepen in de huurprijs. Privélasten (elektriciteit, gas, internet) zijn voor rekening van huurder.",
   "indexatie": true,

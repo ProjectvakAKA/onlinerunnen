@@ -24,3 +24,6 @@
 /Georganiseerd/Contracten/EPC/documents12.pdf
 /Georganiseerd/Contracten/Limburg/Havermarkt_7_bus_4/Havermarkt_7_bus_4_huurcontract.pdf
 /Georganiseerd/Contracten/Brussel/Kerkstraat_1/Kerkstraat_1_EPC.pdf
+/Georganiseerd/Contracten/Limburg/Stiemervalleilaan_5_bus_8/Stiemervalleilaan_5_bus_8_huurcontract.pdf
+/Georganiseerd/Contracten/West-Vlaanderen/Capronstraat_29/Capronstraat_29_huurcontract.pdf
+/Georganiseerd/Contracten/West-Vlaanderen/Marktstraat_8_bus_3/Marktstraat_8_bus_3_huurcontract.pdf

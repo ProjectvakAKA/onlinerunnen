@@ -15,3 +15,6 @@
 /huurovereenkomst_10_smeets_tongeren.pdf
 /huurovereenkomst_01_peters_hasselt.pdf
 /202603161.pdf
+/huurovereenkomst_07_hermans_genk.pdf
+/huurovereenkomst_08_claeys_ieper.pdf
+/huurovereenkomst_09_vanden_bruggen_roeselare.pdf
