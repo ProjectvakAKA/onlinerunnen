@@ -303,20 +303,22 @@ ZOEK SPECIFIEK NAAR:
 - Maandelijkse huurprijs (bedrag in euro)
 - Waarborg/huurwaarborg bedrag
 - Bank waar waarborg gedeponeerd is (naam + IBAN rekening)
-- Gemeenschappelijke kosten (wat is inbegrepen)
-- Privélasten (energie, water, gas, internet)
-- Indexatie (ja/nee) en HOE dit geformuleerd is (bv. “jaarlijks op basis van de gezondheidsindex”)
+- Gemeenschappelijke kosten / common charges: forfait, voorschot, wat is inbegrepen vs privé, mede-eigendom, verdeelsleutel, provisie — alles wat het contract zegt
+- Privélasten (energie, water, gas, internet) als apart vermeld
+- Indexatie: de volledige contractuele bepaling (gezondheidsindex, wettelijke indexering, frequentie, basisjaar, uitzonderingen) — niet alleen ja/nee
 
 BELANGRIJK:
 - Huurprijs = alleen het getal (geen € teken)
 - Waarborg bedrag = alleen het getal
 - waar_gedeponeerd = "Banknaam — rekening BE12 3456 7890 1234" of "Banknaam (rekening BE12 3456 7890 1234)". BEHOUD ALLE leestekens zoals streepjes/dash (—, -), spaties en notatie EXACT zoals in het contract.
 - waar_gedeponeerd MOET een object zijn met value + source_quote (+ word_ids indien genummerde tekst aanwezig is). source_quote = de exacte regel uit het contract met banknaam + IBAN; word_ids = ALLE woord-IDs van die regel, zodat de juiste regel gefluoriseerd kan worden in de PDF.
-- kosten = beschrijving in tekst (wat inbegrepen, wat apart)
-- indexatie = true/false. Mapping:
-  * Als er staat dat de huur jaarlijks/geperiodiseerd wordt geïndexeerd (bv. “jaarlijkse indexering”, “jaarlijks op basis van de gezondheidsindex”, “wordt geïndexeerd volgens de wet”) → indexatie = true.
-  * Als er expliciet staat dat er GEEN indexatie is (bv. “niet geïndexeerd”, “geen indexatie”, “indexering niet van toepassing”) → indexatie = false.
-  * Als er niets over indexatie staat → indexatie = false.
+
+INDEXATIE (zelfde robuustheid als huisdieren_toelating in voorwaarden):
+- indexatie MOET een object zijn met "value" (doorlopende tekst: begin met "Ja —", "Nee —" of "Niet vermeld —"), "source_quote" (exacte zin(nen) uit het contract), "word_ids" (alle IDs van die passage in de genummerde tekst).
+- Geen kale boolean. Als er niets over indexatie staat: value = "Niet vermeld — geen indexatiebepaling gevonden."
+
+GEMEENSCHAPPELIJKE KOSTEN (zelfde robuustheid):
+- gemeenschappelijke_kosten MOET een object met "value" (volledige weergave van wat het contract zegt), "source_quote", "word_ids". Geen lege structuur alleen met "inbegrepen"-lijst zonder brontekst — de lijst mag optioneel extra zijn, maar value + source_quote + word_ids zijn verplicht.
 
 CONTRACT TEKST:
 {text_chunk_1}
@@ -335,15 +337,15 @@ VOORBEELD OUTPUT:
       "word_ids": [201, 202, 203, 204, 205, 206]
     }}
   }},
-  "kosten": "Gemeenschappelijke kosten (verwarming, water, lift) zijn inbegrepen in de huurprijs. Privélasten (elektriciteit, gas, internet) zijn voor rekening van huurder.",
-  "indexatie": true,
+  "indexatie": {{
+    "value": "Ja — de huurprijs wordt jaarlijks geïndexeerd volgens de gezondheidsindex.",
+    "source_quote": "De jaarlijkse huurprijs wordt geïndexeerd overeenkomstig de wettelijke regels betreffende de gezondheidsindex.",
+    "word_ids": [410, 411, 412, 413, 414, 415, 416, 417, 418]
+  }},
   "gemeenschappelijke_kosten": {{
-    "inbegrepen": [
-      {{"post": "Verwarming"}},
-      {{"post": "Water"}},
-      {{"post": "Lift"}},
-      {{"post": "Gemeenschappelijke delen"}}
-    ]
+    "value": "Voorschot gemeenschappelijke kosten € 45/maand; verwarming en lift via mede-eigendom; elektriciteit privé voor huurder.",
+    "source_quote": "Het maandelijks voorschot voor de gemeenschappelijke kosten bedraagt 45 EUR. De kosten van verwarming en lift worden verdeeld volgens mede-eigendom.",
+    "word_ids": [520, 521, 522, 523, 524, 525, 526, 527, 528, 529]
   }}
 }}
 {source_quote_instruction}
@@ -390,15 +392,22 @@ TAAK: Extraheer ALLE bijzondere voorwaarden en bepalingen.
 
 ZOEK SPECIFIEK NAAR:
 - Huisdieren: WAT staat er precies? (niet alleen ja/nee — bv. "honden niet, katten niet, vissen wel", "alleen kleine kooidieren", "met toestemming verhuurder")
-- Onderverhuur toegestaan? (ja/nee)
-- Werken/verbouwingen (wat mag/niet mag)
+- Onderverhuur / Airbnb / onderhuur / tussenverhuur: de EXACTE bepaling (artikel, opschrift, volledige zin)
+- Werken/verbouwingen (wat mag/niet mag) — exact citeren
 - Andere bijzondere bepalingen
 
 BELANGRIJK:
 - huisdieren_toelating = de VOLLEDIGE, LETTERLIJKE tekst uit het contract over huisdieren. Bijv. "Honden en katten zijn niet toegestaan. Vissen en kleine kooidieren zijn wel toegestaan." Of "Huisdieren zijn verboden." Geen samenvatting zoals alleen "ja" of "nee" — geef de exacte bewoording zodat duidelijk is wat wel/niet mag. Als er niets over huisdieren staat: "ONTBREKEND".
-- onderverhuur = true/false
-- werken = beschrijving in tekst
-- BRON EN MARKERING: Voor huisdieren_toelating MOET je source_quote en word_ids geven. source_quote = de exacte zin(nen) uit het contract over huisdieren (letterlijk overnemen). word_ids = de IDs van ALLE woorden van die passage in de genummerde tekst, zodat in de PDF precies die zin wordt gemarkeerd (gefluoriseerd). Wijs ALLEEN de zin over huisdieren aan, niet een andere zin met "toegestaan" of "verboden".
+
+- onderverhuur = OBJECT (nooit alleen true/false):
+  * "value": doorlopende tekst die het contract samenvat, begin met "Ja —" of "Nee —" (bv. "Nee — Geen onderverhuur (inclusief Airbnb)." als dat in het contract staat).
+  * "source_quote": de EXACTE zin(nen) uit het contract over onderverhuur, onderhuur, Airbnb, tussenverhuur, mee-verhuur — letterlijk overnemen (inclusief nummers zoals "6. …").
+  * "word_ids": ALLE woord-IDs van die passage in de genummerde tekst (volledige fluor in de PDF).
+- Zonder object + source_quote + word_ids is het antwoord ONVOLDOENDE.
+
+- werken = OBJECT met "value" (wat het contract zegt over herstellingen/verbouwingen), "source_quote", "word_ids" — zelfde markering als hierboven. Als er niets staat: value "ONTBREKEND" en lege word_ids weglaten.
+
+- BRON EN MARKERING: Voor huisdieren_toelating, onderverhuur EN werken MOET je source_quote en word_ids geven waar de tekst in het contract staat. Wijs ALLEEN de passage aan die bij dat onderwerp hoort.
 
 CONTRACT TEKST:
 {text_chunk_1}
@@ -409,8 +418,16 @@ Extra context:
 VOORBEELD OUTPUT:
 {{
   "huisdieren_toelating": {{ "value": "Honden en katten zijn niet toegestaan. Vissen en kleine kooidieren zijn wel toegestaan.", "source_quote": "Honden en katten zijn niet toegestaan. Vissen en kleine kooidieren zijn wel toegestaan.", "word_ids": [123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135] }},
-  "onderverhuur": false,
-  "werken": "Kleine herstellingswerken toegestaan. Grotere verbouwingen enkel met schriftelijke toestemming van verhuurder."
+  "onderverhuur": {{
+    "value": "Nee — Geen onderverhuur (inclusief Airbnb).",
+    "source_quote": "6. Geen onderverhuur (inclusief Airbnb)",
+    "word_ids": [240, 241, 242, 243, 244, 245, 246, 247]
+  }},
+  "werken": {{
+    "value": "Kleine herstellingswerken toegestaan; grotere verbouwingen enkel met schriftelijke toestemming.",
+    "source_quote": "Kleine herstellingswerken zijn toegestaan. Grotere verbouwingen slechts na schriftelijke toestemming van de verhuurder.",
+    "word_ids": [310, 311, 312, 313, 314, 315, 316, 317, 318, 319]
+  }}
 }}
 {source_quote_instruction}
 ALLEEN JSON:"""
@@ -458,83 +475,164 @@ ALLEEN JSON:"""
 
 
 # =============================================================================
-# EPC-DOCUMENT (EPB-certificaat / energieprestatiecertificaat)
+# EPC (Vlaams Energieprestatiecertificaat) — multi-stage extractie (contract_system)
+# Placeholders: text_chunk_1, text_chunk_2, source_quote_instruction
 # =============================================================================
-# Placeholder: text_chunk_1 (volledige tekst), eventueel text_chunk_2 voor extra context
 
-PROMPT_EPC = """Je bent een vastgoeddata-analist gespecialiseerd in Belgische EPB-certificaten (EPC).
-Analyseer het meegestuurde EPB-certificaat en geef ALLEEN een geldig JSON-object terug, zonder uitleg of markdown.
+PROMPT_EPC_METADATA = """Je bent een expert in Vlaamse energieprestatiecertificaten (EPC / EPB) en leest uitsluitend brongegevens uit het document.
 
-REGELS (strikt volgen):
-- Gebruik ALLEEN waarden die expliciet in het document staan of die je exact kunt berekenen (bv. jaarlijkse kost uit verbruik × prijs). Bij twijfel of ontbreken: null.
-- Datums altijd in formaat YYYY-MM-DD. Getallen als getal (geen strings), behalve adres en vrije tekst.
-- Adres en energieklasse: letterlijk overnemen zoals op het certificaat (geen afkortingen tenzij zo vermeld).
-- Geen velden invullen met gokken of aannames. Liever null dan fout.
+TAAK: Extraheer metadata van het certificaat. Geef ALLEEN geldig JSON terug, zonder markdown of uitleg.
 
-Extraheer én BEREKEN (alleen indien in document of exact berekenbaar) de volgende velden:
+TAAL & REGIO: Het document is in het Nederlands (België/Vlaanderen). Zoek naar typische benamingen: certificaatnummer, attestnummer, uniek identificatienummer, opmaakdatum, datum opmaak, uitgiftedatum, geldig tot, vervaldatum, energiedeskundige, erkend deskundige, certificerend deskundige.
 
-IDENTIFICATIE:
-- adres: volledig adres van het gebouw/eenheid (zoals op certificaat)
-- appartement_nr: appartementsnummer indien van toepassing
-- vloeroppervlakte_m2: bewoonbare oppervlakte in m² (getal)
-- volume_m3: volume indien vermeld (getal)
-- geldig_tot: einddatum geldigheid (YYYY-MM-DD)
-- afgeleverd_op: datum aflevering attest (YYYY-MM-DD)
+REGELS:
+- Gebruik alleen tekst die letterlijk in het document staat. Bij twijfel: null.
+- Datums in het veld "datum_opmaak" en "geldig_tot" strikt als string "DD/MM/YYYY" (voorbeeld: 15/03/2024). Als het document een andere notatie gebruikt, converteer naar DD/MM/YYYY.
+- certificaat_nummer: volledig nummer zoals op het attest (inclusief streepjes/slashes indien zo gedrukt).
+- energiedeskundige: naam van de erkende energiedeskundige of certificaatuitgever indien vermeld.
 
-ENERGIEPRESTATIE:
-- energieklasse: A++, A+, A, B+, B, B-, C+, C, C-, D t/m G
-- epb_score: numerieke EPB-score indien vermeld
-- co2_uitstoot_kg_m2_jaar: CO₂-uitstoot in kg/m²/jaar
-- netto_energiebehoefte_verwarming: kWh/m²
-- primair_verbruik_per_m2: primair energieverbruik per m²
-- totaal_verbruik_jaar_kwh: totaal verbruik per jaar in kWh
+VERPLICHTE JSON-STRUCTUUR (exact deze sleutels):
+{{
+  "certificaat_nummer": null,
+  "datum_opmaak": null,
+  "geldig_tot": null,
+  "energiedeskundige": null
+}}
 
-GESCHATTE ENERGIEKOST (bereken indien mogelijk):
-- geschatte_jaarlijkse_energiekost_eur: totaal kWh * ca. 0,30 EUR (gem. Belgische prijs)
-- geschatte_maandelijkse_energiekost_eur: jaarlijkse kost / 12, afgerond op 5 EUR
-- energiekost_label: "Zeer laag (<50€/mnd)" | "Laag (50-100€)" | "Gemiddeld (100-150€)" | "Hoog (150-250€)" | "Zeer hoog (>250€/mnd)"
-
-INSTALLATIES:
-- verwarmingssysteem: bv. "Warmtepomp", "Condenserende ketel"
-- verwarming_collectief: true/false
-- sanitair_warm_water: bv. "Condenserende ketel"
-- sww_collectief: true/false
-- ventilatie_type: A, B, C of D
-- hernieuwbare_energie: true indien zonnepanelen/warmtepomp/hernieuwbaar
-
-ISOLATIE & COMFORT:
-- u_waarde_venster: W/m².K (lager = beter)
-- u_waarde_opaque: W/m².K
-- luchtdichtheid_m3_h_m2: indien vermeld
-- oververhitting_risico: "Laag" | "Gemiddeld" | "Hoog"
-- ventilatie_conform: true/false
-
-EPB-CONFORMITEIT:
-- voldoet_nev: true indien netto energiebehoefte ≤ 15 kWh/m²
-- voldoet_primair_verbruik: true/false
-- voldoet_isolatie: true/false
-- aantal_niet_conform: aantal EPB-eisen die niet gehaald zijn (getal)
-
-SCORES (schaal 1-10, zelf inschatten op basis van certificaat):
-- score_energiezuinigheid: 10 = A++, 1 = G
-- score_comfort: o.b.v. ventilatie, oververhitting, luchtdichtheid
-- score_toekomstbestendigheid: hoog bij warmtepomp + hernieuwbaar + goede isolatie
-- score_totaal: gewogen gemiddelde (40% energiezuinig + 30% comfort + 30% toekomst)
-
-MATCHING:
-- profiel_tags: array van tags, kies uit: "Zeer energiezuinig", "Lage energiekost", "Warmtepomp", "Zonnepanelen", "Collectief systeem", "Instapklaar", "Renovatienodig", "Ideaal voor huurder", "Ideaal voor investeerder", "Toekomstbestendig", "Nieuwbouw kwaliteit"
-
-SAMENVATTING:
-- verkoop_argument_energie: max 2 zinnen voor makelaar (bv. "Energieklasse B+, geschatte energiekost €52/maand dankzij warmtepomp.")
-- aandachtspunten: array van zwakke punten (bv. "Ventilatie type C: minder comfortabel dan D")
-
-DOCUMENT TEKST (EPB-certificaat):
+CERTIFICAATTEKST:
 {text_chunk_1}
 
-Extra context (indien nodig):
+Aanvullende context (later in document):
 {text_chunk_2}
 
-Geef ALLEEN het JSON-object. Alle sleutels aanwezig; gebruik null waar het veld ontbreekt of onzeker is. Geen tekst voor of na de JSON."""
+{source_quote_instruction}
+ALLEEN JSON:"""
+
+
+PROMPT_EPC_GEBOUW = """Je bent een expert in Vlaamse EPC-documenten. Extraheer gebouwgegevens. Alleen JSON, geen markdown.
+
+TAAK: Vul het object "gebouw" volgens het schema. Zoek naar: adres van het gebouw, interne referentie/projectreferentie, bouwjaar (of referentiejaar gebouw), bruikbare vloeroppervlakte (m²), beschermd volume (m³) indien vermeld.
+
+REGELS:
+- adres: volledig adres zoals op het certificaat (straat, nummer, bus, postcode, gemeente).
+- referentie: interne ref., dossiernummer of identificatie van de eenheid indien vermeld; anders null.
+- bouwjaar, oppervlakte_m2, volume_m3: alleen gehele getallen (integers). Geen eenhedes in het getal. Als alleen decimaal oppervlakte: rond af naar het dichtstbijzijnde geheel of neem het gehele deel zoals het document vermeldt. Ontbreekt het veld: null.
+
+VERPLICHTE JSON-STRUCTUUR:
+{{
+  "adres": null,
+  "referentie": null,
+  "bouwjaar": null,
+  "oppervlakte_m2": null,
+  "volume_m3": null
+}}
+
+CERTIFICAATTEKST:
+{text_chunk_1}
+
+Aanvullende context:
+{text_chunk_2}
+
+{source_quote_instruction}
+ALLEEN JSON:"""
+
+
+PROMPT_EPC_PRESTATIES = """Je bent een expert in Vlaamse EPC/EPB-rapporten. Extraheer energieprestatiecijfers. Alleen JSON.
+
+TAAK: Zoek in het document naar numerieke prestatie-indicatoren. Typische Vlaamse termen: netto energiebehoefte, primaire energie, referentie-eis, doelstelling, CO₂-emissie, S-peil, energieprestatiescore, kWh/m², kg CO₂, enz.
+
+REGELS:
+- Alle waarden als gehele getallen (integers) of null. Geen strings met eenheden.
+- energiescore_kwh_m2: score of netto energiebehoefte uitgedrukt in kWh/m² jaar indien het document dat zo rapporteert.
+- doelstelling_kwh_m2: wettelijke referentie/doelstelling in kWh/m² jaar indien vermeld.
+- primair_verbruik_kwh: totaal of specifiek primair energieverbruik in kWh (document-specifiek).
+- co2_emissie_kg: totale of relevante CO₂-emissie in kg (zoals het attest vermeldt).
+- s_peil: S-peil als geheel getal indien aanwezig.
+- Vul alleen wat expliciet of eenduidig af te leiden is; anders null.
+
+VERPLICHTE JSON-STRUCTUUR:
+{{
+  "energiescore_kwh_m2": null,
+  "doelstelling_kwh_m2": null,
+  "primair_verbruik_kwh": null,
+  "co2_emissie_kg": null,
+  "s_peil": null
+}}
+
+CERTIFICAATTEKST:
+{text_chunk_1}
+
+Aanvullende context:
+{text_chunk_2}
+
+{source_quote_instruction}
+ALLEEN JSON:"""
+
+
+PROMPT_EPC_INSTALLATIES = """Je bent een expert in Vlaamse EPC-documenten. Beschrijf technische installaties in korte tekst. Alleen JSON.
+
+TAAK: Vul installatievelden op basis van het attest (hoofdcomponenten, geen lange paragrafen).
+
+REGELS:
+- verwarming: type systeem (bv. condensatieketel, warmtepomp, stadsverwarming) + kort kenmerk indien vermeld.
+- sanitair_warm_water: productie warm water (bv. elektrische boiler, ketel, warmtepomp).
+- zonne_energie: pv/zonne-energie (bv. "Geen", "Zonnepanelen 3 kWp") zoals in het document.
+- ventilatie: type systeem (A/B/C/D of mechanisch/natuurlijk) + korte toelichting indien aanwezig.
+- Ontbreekt informatie over een onderdeel: gebruik null (niet raden).
+
+VERPLICHTE JSON-STRUCTUUR:
+{{
+  "verwarming": null,
+  "sanitair_warm_water": null,
+  "zonne_energie": null,
+  "ventilatie": null
+}}
+
+CERTIFICAATTEKST:
+{text_chunk_1}
+
+Aanvullende context:
+{text_chunk_2}
+
+{source_quote_instruction}
+ALLEEN JSON:"""
+
+
+PROMPT_EPC_AANBEVELINGEN = """Je bent een expert in Vlaamse EPC-documenten. Extraheer alle aanbevelingen voor verbetering (renovatie-adviezen, prioritaire maatregelen, kostenramingen).
+
+TAAK: Bouw een JSON-array "aanbevelingen". Elke aanbeveling heeft: onderdeel (bv. Muren, Vensters, Dak, Verwarming), actie (korte beschrijving), prijs_min_eur en prijs_max_eur als gehele eurobedrag of null als geen range gegeven.
+
+REGELS:
+- Als het document een tabel met meerdere maatregelen heeft: één object per maatregel.
+- Geen dubbele entries tenzij het document ze dubbel vermeldt.
+- prijs_min_eur / prijs_max_eur: alleen als het document een kostenrange of geschatte investering vermeldt; anders null.
+- Als er geen aanbevelingen in het document staan: geef een lege array [].
+
+VERPLICHTE JSON-STRUCTUUR (array kan leeg zijn):
+{{
+  "aanbevelingen": []
+}}
+
+Voorbeeld met twee items:
+{{
+  "aanbevelingen": [
+    {{
+      "onderdeel": "Vensters",
+      "actie": "Hoogrendementsbeglazing",
+      "prijs_min_eur": 4000,
+      "prijs_max_eur": 8000
+    }}
+  ]
+}}
+
+CERTIFICAATTEKST:
+{text_chunk_1}
+
+Aanvullende context:
+{text_chunk_2}
+
+{source_quote_instruction}
+ALLEEN JSON:"""
 
 
 # =============================================================================

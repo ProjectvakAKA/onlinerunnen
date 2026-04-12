@@ -7,6 +7,8 @@ Fase 2: Analyseert huurcontracten en genereert JSON
 BELANGRIJK: Gebruik .env.local in de projectroot met alle credentials (zelfde als Next.js)
 """
 
+from contextlib import contextmanager
+
 import dropbox
 import pdfplumber
 import fitz  # PyMuPDF
@@ -17,6 +19,7 @@ import smtplib
 import json
 import base64
 import re
+import unicodedata
 import signal
 import logging
 import functools
@@ -30,6 +33,12 @@ from typing import Any, Dict, List, Optional, Set, Tuple, Callable
 from pdf2image import convert_from_bytes
 from PIL import Image
 from dotenv import load_dotenv
+
+try:
+    import fcntl  # exclusieve lock: voorkomt dubbele analyse bij 2× `python contract_system.py`
+    _HAS_FCNTL = True
+except ImportError:
+    _HAS_FCNTL = False
 
 # Key rotator: geïntegreerd in dit bestand (geen aparte gemini_key_rotator meer)
 
@@ -85,7 +94,11 @@ from prompts import (
     PROMPT_VOORWAARDEN,
     PROMPT_JURIDISCH,
     PROMPT_METADATA,
-    PROMPT_EPC,
+    PROMPT_EPC_METADATA,
+    PROMPT_EPC_GEBOUW,
+    PROMPT_EPC_PRESTATIES,
+    PROMPT_EPC_INSTALLATIES,
+    PROMPT_EPC_AANBEVELINGEN,
     PROMPT_SUMMARY,
     EMAIL_SUBJECT,
     EMAIL_BODY,
@@ -297,6 +310,7 @@ BATCH_SIZE = 5
 # History files: vast pad in alexander/ zodat cwd geen verschil maakt (geen dubbele verwerking)
 ORGANIZED_HISTORY = os.path.join(_script_dir, "organized_history.txt")
 ANALYZED_HISTORY = os.path.join(_script_dir, "analyzed_docs.txt")
+PHASE2_LOCK_PATH = os.path.join(_script_dir, ".phase2_analysis.lock")
 FOLDER_CACHE = os.path.join(_script_dir, "folder_structure.json")
 
 # CSV log in TARGET (v2 = nieuw format met extracted_* kolommen; wordt automatisch gebruikt als oude CSV nog bestaat)
@@ -507,6 +521,50 @@ class ContractNormalizer:
             return out
         return num
 
+    def _text_passage_field_for_output(self, obj: Any, key: str) -> Optional[dict]:
+        """Lange tekst + source_quote + word_ids (zelfde patroon als huisdieren_toelating)."""
+        v = self._safe_get(obj, key, default=None)
+        if not isinstance(v, dict) or "value" not in v:
+            return None
+        out: Dict[str, Any] = {}
+        val = v.get("value")
+        if isinstance(val, bool):
+            if key == "indexatie":
+                out["value"] = "Ja — indexatie van toepassing." if val else "Nee — geen indexatie."
+            elif key == "onderverhuur":
+                out["value"] = "Ja — onderverhuur is toegestaan." if val else "Nee — onderverhuur is niet toegestaan."
+            else:
+                out["value"] = "Ja." if val else "Nee."
+        else:
+            out["value"] = "" if val is None else str(val)
+        if v.get("source_quote") is not None:
+            out["source_quote"] = v["source_quote"]
+        if v.get("source_page") is not None:
+            out["source_page"] = v["source_page"]
+        if v.get("word_ids") is not None:
+            out["word_ids"] = v["word_ids"]
+        return out
+
+    def _legacy_gemeenschappelijke_kosten_string(self, financieel: dict) -> str:
+        """Oude extracties: kosten-string of inbegrepen-lijst."""
+        kosten_raw = self._safe_get_value(financieel, 'kosten')
+        if kosten_raw is not None and kosten_raw != "":
+            return str(kosten_raw)
+        gem_kosten = self._safe_get(financieel, 'gemeenschappelijke_kosten', default={})
+        if isinstance(gem_kosten, dict):
+            inbegrepen_items = self._safe_get(gem_kosten, 'inbegrepen', default=[])
+            if inbegrepen_items:
+                items_text = []
+                for item in inbegrepen_items:
+                    if isinstance(item, dict):
+                        post = self._safe_get(item, 'post')
+                        if post:
+                            items_text.append(str(post))
+                if items_text:
+                    return f"Gemeenschappelijke kosten ({', '.join(items_text)}) zijn inbegrepen in de huurprijs."
+                return "Gemeenschappelijke kosten inbegrepen."
+        return ""
+
     def _normalize_boolean(self, value: Any) -> Optional[bool]:
         value = _unwrap_field_value(value)
         if value is None or value == "":
@@ -709,42 +767,48 @@ class ContractNormalizer:
         else:
             waar_gedeponeerd = ""
 
-        # Kosten
-        kosten_raw = self._safe_get_value(financieel, 'kosten')
-        if kosten_raw is not None and kosten_raw != "":
-            kosten = str(kosten_raw)
+        # Indexatie: rich passage + bron (fluo), fallback op boolean/string
+        idx_raw = self._safe_get(financieel, 'indexatie')
+        if isinstance(idx_raw, dict) and "value" in idx_raw:
+            indexatie_out = self._text_passage_field_for_output(financieel, 'indexatie') or {
+                "value": str(idx_raw.get("value", "")),
+            }
+        elif isinstance(idx_raw, bool):
+            indexatie_out = {
+                "value": ("Ja — indexatie van toepassing." if idx_raw else "Nee — geen indexatie."),
+            }
         else:
-            gem_kosten = self._safe_get(financieel, 'gemeenschappelijke_kosten', default={})
-            if isinstance(gem_kosten, dict):
-                inbegrepen_items = self._safe_get(gem_kosten, 'inbegrepen', default=[])
-                if inbegrepen_items:
-                    items_text = []
-                    for item in inbegrepen_items:
-                        if isinstance(item, dict):
-                            post = self._safe_get(item, 'post')
-                            if post:
-                                items_text.append(post)
-                    if items_text:
-                        kosten = f"Gemeenschappelijke kosten ({', '.join(items_text)}) zijn inbegrepen in de huurprijs."
-                    else:
-                        kosten = "Gemeenschappelijke kosten inbegrepen."
-                else:
-                    kosten = ""
+            b = self._normalize_boolean(
+                self._safe_get_value(financieel, 'indexatie')
+                or self._safe_get_value(financieel, 'indexering')
+            )
+            if b is True:
+                indexatie_out = {"value": "Ja — indexatie van toepassing (model)."}
+            elif b is False:
+                indexatie_out = {"value": "Nee — geen indexatie (model)."}
             else:
-                kosten = ""
+                indexatie_out = {"value": "Niet vermeld — geen indexatie-informatie."}
 
-        # Indexatie
-        indexatie = self._normalize_boolean(self._safe_get_value(financieel, 'indexatie') or self._safe_get_value(financieel, 'indexering'))
+        # Gemeenschappelijke kosten: rich passage + bron (fluo)
+        g_raw = self._safe_get(financieel, 'gemeenschappelijke_kosten')
+        if isinstance(g_raw, dict) and g_raw.get("value") is not None:
+            gemeenschappelijke_kosten_out = self._text_passage_field_for_output(
+                financieel, 'gemeenschappelijke_kosten'
+            ) or {"value": str(g_raw.get("value", ""))}
+        else:
+            legacy = self._legacy_gemeenschappelijke_kosten_string(financieel)
+            gemeenschappelijke_kosten_out = {"value": legacy or "ONTBREKEND"}
 
-        return {
+        out: Dict[str, Any] = {
             "huurprijs": huurprijs,
             "waarborg": {
                 "bedrag": waarborg_bedrag,
-                "waar_gedeponeerd": self._get_field_for_output(waarborg_raw, 'waar_gedeponeerd') or waar_gedeponeerd
+                "waar_gedeponeerd": self._get_field_for_output(waarborg_raw, 'waar_gedeponeerd') or waar_gedeponeerd,
             },
-            "kosten": self._get_field_for_output(financieel, 'kosten') or kosten,
-            "indexatie": indexatie
+            "indexatie": indexatie_out,
+            "gemeenschappelijke_kosten": gemeenschappelijke_kosten_out,
         }
+        return out
 
     def _normalize_periodes_flat(self, data: dict) -> dict:
         """Returns flat periodes"""
@@ -781,7 +845,7 @@ class ContractNormalizer:
         }
 
     def _normalize_voorwaarden_flat(self, data: dict) -> dict:
-        """Returns flat voorwaarden. huisdieren_toelating = volledige tekst (met source_quote/word_ids voor PDF-markering)."""
+        """Returns flat voorwaarden. huisdieren / onderverhuur / werken met source_quote + word_ids voor PDF-markering."""
         voorwaarden = self._safe_get(data, 'voorwaarden', default={})
 
         # Uitgebreide huisdierenbepaling (tekst + bron voor fluor)
@@ -795,13 +859,35 @@ class ContractNormalizer:
                 h = self._normalize_boolean(huisdieren_raw)
             huisdieren_toelating = "Ja" if h is True else ("Nee" if h is False else "")
 
-        onderverhuur = self._normalize_boolean(self._safe_get_value(voorwaarden, 'onderverhuur'))
-        werken = self._get_field_for_output(voorwaarden, 'werken') or ""
+        # Onderverhuur: altijd object voor flatten + fluor (niet kale boolean)
+        ov_raw = self._safe_get(voorwaarden, 'onderverhuur')
+        if isinstance(ov_raw, dict) and ov_raw.get("value") is not None:
+            onderverhuur_out = self._text_passage_field_for_output(voorwaarden, 'onderverhuur') or {
+                "value": str(ov_raw.get("value", "")),
+            }
+        else:
+            b = self._normalize_boolean(self._safe_get_value(voorwaarden, 'onderverhuur'))
+            if b is True:
+                onderverhuur_out = {"value": "Ja — onderverhuur is toegestaan (geen brontekst in extract)."}
+            elif b is False:
+                onderverhuur_out = {"value": "Nee — onderverhuur is niet toegestaan (geen brontekst in extract)."}
+            else:
+                onderverhuur_out = {"value": "ONTBREKEND"}
+
+        # Werken: rich object of legacy string
+        w_raw = self._safe_get(voorwaarden, 'werken')
+        if isinstance(w_raw, dict) and w_raw.get("value") is not None:
+            werken_out = self._text_passage_field_for_output(voorwaarden, 'werken') or {
+                "value": str(w_raw.get("value", "")),
+            }
+        else:
+            w_str = self._safe_get_value(voorwaarden, 'werken')
+            werken_out = {"value": str(w_str)} if w_str not in (None, "") else {"value": "ONTBREKEND"}
 
         return {
             "huisdieren_toelating": huisdieren_toelating,
-            "onderverhuur": onderverhuur,
-            "werken": werken
+            "onderverhuur": onderverhuur_out,
+            "werken": werken_out,
         }
 
     def _normalize_juridisch_flat(self, data: dict) -> dict:
@@ -1050,15 +1136,63 @@ def load_history(filename):
 
 
 def add_to_history(filename, path):
-    """Add file to history (pad genormaliseerd, één pad per regel)."""
+    """Add file to history (pad genormaliseerd, één pad per regel). Idempotent: geen dubbele regels."""
     norm = _normalize_dropbox_path(path)
     if not norm or not _is_valid_history_line(norm):
         return
     try:
+        existing = load_history(filename)
+        if norm in existing:
+            return
         with open(filename, 'a', encoding='utf-8') as f:
             f.write(f"{norm}\n")
     except Exception as e:
         print(f"⚠️  History update failed: {e}")
+
+
+@contextmanager
+def _phase2_analysis_lock():
+    """Exclusieve lock rond claim op analyzed_docs (twee terminal-processen / dev:all)."""
+    if not _HAS_FCNTL:
+        yield
+        return
+    fp = open(PHASE2_LOCK_PATH, "a+")
+    try:
+        fcntl.flock(fp.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fp.fileno(), fcntl.LOCK_UN)
+        fp.close()
+
+
+def dedupe_history_file_on_disk(filename: str) -> None:
+    """Verwijdert dubbele regels in een history-bestand (behoudt volgorde, één keer bij start)."""
+    try:
+        with open(filename, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        return
+    seen: Set[str] = set()
+    out: List[str] = []
+    changed = False
+    for line in lines:
+        if not line.strip() or not _is_valid_history_line(line):
+            changed = True
+            continue
+        n = _normalize_dropbox_path(line)
+        if n in seen:
+            changed = True
+            continue
+        seen.add(n)
+        out.append(f"{n}\n")
+    if not changed:
+        return
+    try:
+        with open(filename, "w", encoding="utf-8") as f:
+            f.writelines(out)
+        print(f"✓ History opgeschoond (dubbele regels verwijderd): {os.path.basename(filename)}")
+    except Exception as e:
+        print(f"⚠️  History-dedup mislukt ({filename}): {e}")
 
 
 def remove_from_history(filename, path):
@@ -2348,6 +2482,194 @@ def build_numbered_prompt(all_words: List[Dict[str, Any]], max_chars: int) -> st
     return "".join(parts).strip() if parts else ""
 
 
+def _normalize_match_token(t: str) -> str:
+    if not t:
+        return ""
+    t = unicodedata.normalize("NFKC", t)
+    t = t.strip().lower()
+    t = t.strip(".,;:!?\"'«»()[]")
+    if len(t) > 1 and t.endswith(".") and t[:-1].isdigit():
+        t = t[:-1]
+    return t
+
+
+def _tokenize_for_match(s: str) -> List[str]:
+    if not s or not str(s).strip():
+        return []
+    parts = re.findall(r"[A-Za-zÀ-ÿ0-9]+(?:[.'-][A-Za-zÀ-ÿ0-9]+)?", str(s))
+    return [x for x in (_normalize_match_token(p) for p in parts) if x]
+
+
+_ONDERVERHUUR_KEYWORDS = frozenset(
+    {
+        "onderverhuur",
+        "onderhuur",
+        "tussenverhuur",
+        "meeverhuur",
+        "airbnb",
+        "booking",
+        "shortstay",
+    }
+)
+
+
+def find_word_ids_for_source_quote(source_quote: str, all_words: List[Dict[str, Any]]) -> Optional[List[int]]:
+    """
+    Map source_quote to contiguous word IDs in all_words (volledige PDF, niet alleen het genummerde prompt-deel).
+    Oplossing voor lange contracten waar build_numbered_prompt stopt vóór de clausule over onderverhuur.
+    """
+    if not source_quote or not all_words:
+        return None
+    q_tokens = _tokenize_for_match(source_quote)
+    if not q_tokens:
+        return None
+    hay_tokens: List[str] = []
+    hay_ids: List[int] = []
+    for w in all_words:
+        tid = w.get("id")
+        if tid is None:
+            continue
+        nt = _normalize_match_token(str(w.get("text", "")))
+        if not nt:
+            continue
+        hay_tokens.append(nt)
+        hay_ids.append(int(tid))
+    n, m = len(hay_tokens), len(q_tokens)
+    if m > n or m == 0:
+        return None
+    for start in range(n - m + 1):
+        if hay_tokens[start : start + m] == q_tokens:
+            return hay_ids[start : start + m]
+    for take in range(min(m, 18), 2, -1):
+        tail = q_tokens[-take:]
+        tl = len(tail)
+        for start in range(n - tl + 1):
+            if hay_tokens[start : start + tl] == tail:
+                return hay_ids[start : start + tl]
+    for kw in _ONDERVERHUUR_KEYWORDS:
+        if kw not in q_tokens:
+            continue
+        idx = q_tokens.index(kw)
+        mid = q_tokens[max(0, idx - 1) : idx + 10]
+        ml = len(mid)
+        if ml < 2:
+            continue
+        for start in range(n - ml + 1):
+            if hay_tokens[start : start + ml] == mid:
+                return hay_ids[start : start + ml]
+    for i, ht in enumerate(hay_tokens):
+        if ht in _ONDERVERHUUR_KEYWORDS or "airbnb" in ht:
+            lo = max(0, i - 4)
+            hi = min(n, i + 14)
+            return hay_ids[lo:hi]
+    return None
+
+
+def _regex_find_onderverhuur_snippet(full_text: str) -> Optional[str]:
+    """Haal een leesbare bronregel uit de volledige tekst (als het model geen source_quote gaf)."""
+    if not full_text or len(full_text) < 20:
+        return None
+    for line in full_text.splitlines():
+        t = line.strip()
+        if len(t) < 12 or len(t) > 600:
+            continue
+        if re.search(
+            r"onderverhuur|tussenverhuur|onder\s*[-]?\s*verhuur|airbnb|mee\s*verhuur|booking\.com",
+            t,
+            re.I,
+        ):
+            return t
+    compact = re.sub(r"\s+", " ", full_text)
+    m = re.search(
+        r".{0,55}(?:\d+\.\s*)?(?:geen\s+)?(?:onderverhuur|tussenverhuur|onder\s*verhuur)[^.]{8,200}\.",
+        compact,
+        re.I,
+    )
+    if m:
+        s = m.group(0).strip()
+        if 12 <= len(s) <= 550:
+            return s
+    return None
+
+
+def _enrich_word_ids_from_source_quotes(data: Any, all_words: Optional[List[Dict[str, Any]]]) -> None:
+    """Vul ontbrekende word_ids af vanuit source_quote (alle bron-velden)."""
+    if not all_words:
+        return
+    if isinstance(data, dict):
+        keys = set(data.keys())
+        if "value" in keys and keys <= {"value", "source_quote", "source_page", "word_ids"}:
+            sq = data.get("source_quote")
+            wids = data.get("word_ids")
+            if sq and isinstance(sq, str) and sq.strip():
+                if not wids or (isinstance(wids, list) and len(wids) == 0):
+                    found = find_word_ids_for_source_quote(sq.strip(), all_words)
+                    if found:
+                        data["word_ids"] = found
+            return
+        for v in data.values():
+            _enrich_word_ids_from_source_quotes(v, all_words)
+    elif isinstance(data, list):
+        for item in data:
+            _enrich_word_ids_from_source_quotes(item, all_words)
+
+
+def _ensure_onderverhuur_rich_field(
+    voorwaarden: dict,
+    full_text: str,
+) -> None:
+    """
+    Boolean-only / ontbrekende source_quote → object met bronregel + (via all_words) word_ids.
+    """
+    if not isinstance(voorwaarden, dict):
+        return
+    ov = voorwaarden.get("onderverhuur")
+
+    if ov is True or ov is False:
+        snippet = _regex_find_onderverhuur_snippet(full_text)
+        base = "Ja — onderverhuur is toegestaan." if ov else "Nee — onderverhuur is niet toegestaan."
+        val = base
+        if snippet:
+            low = snippet.lower()
+            if any(x in low for x in ("geen onderverhuur", "geen onder", "niet toegestaan", "verboden")):
+                val = f"Nee — {snippet.strip()[:320]}"
+            elif any(x in low for x in ("toegestaan", " mag ", "mogen")):
+                val = f"Ja — {snippet.strip()[:320]}"
+            else:
+                val = f"{'Ja' if ov else 'Nee'} — {snippet.strip()[:320]}"
+        voorwaarden["onderverhuur"] = {
+            "value": val,
+            "source_quote": (snippet or "").strip(),
+        }
+        return
+
+    if not isinstance(ov, dict):
+        return
+
+    val = ov.get("value")
+    if isinstance(val, bool):
+        snippet = ov.get("source_quote") if isinstance(ov.get("source_quote"), str) else None
+        if not (snippet and snippet.strip()):
+            snippet = _regex_find_onderverhuur_snippet(full_text) or ""
+        text_val = (
+            f"{'Ja' if val else 'Nee'} — {snippet.strip()[:320]}"
+            if snippet and snippet.strip()
+            else ("Ja — onderverhuur is toegestaan." if val else "Nee — onderverhuur is niet toegestaan.")
+        )
+        ov["value"] = text_val
+        if snippet and snippet.strip():
+            ov["source_quote"] = snippet.strip()
+        elif "source_quote" in ov and not str(ov.get("source_quote") or "").strip():
+            ov.pop("source_quote", None)
+        return
+
+    sq = ov.get("source_quote")
+    if not (isinstance(sq, str) and sq.strip()):
+        snippet = _regex_find_onderverhuur_snippet(full_text)
+        if snippet:
+            ov["source_quote"] = snippet
+
+
 def get_document_type_from_path_and_name(path: str, name: str) -> str:
     """Bepaal documenttype uit pad en bestandsnaam (oude structuur /Contracten/Type/Adres of nieuwe /Contracten/Provincie/Adres met Adres_Type.pdf)."""
     path_upper = (path or "").upper().replace("\\", "/")
@@ -2367,137 +2689,344 @@ def get_document_type_from_path_and_name(path: str, name: str) -> str:
     return "huurcontract"
 
 
-# Numeric EPC keys (must be int or float in output)
-_EPC_NUMERIC_KEYS = frozenset({
-    'vloeroppervlakte_m2', 'volume_m3', 'epb_score', 'co2_uitstoot_kg_m2_jaar',
-    'netto_energiebehoefte_verwarming', 'primair_verbruik_per_m2', 'totaal_verbruik_jaar_kwh',
-    'geschatte_jaarlijkse_energiekost_eur', 'geschatte_maandelijkse_energiekost_eur',
-    'u_waarde_venster', 'u_waarde_opaque', 'luchtdichtheid_m3_h_m2', 'aantal_niet_conform',
-    'score_energiezuinigheid', 'score_comfort', 'score_toekomstbestendigheid', 'score_totaal',
-})
-_EPC_DATE_KEYS = frozenset({'geldig_tot', 'afgeleverd_op'})
-_EPC_BOOL_KEYS = frozenset({
-    'verwarming_collectief', 'sww_collectief', 'hernieuwbare_energie',
-    'ventilatie_conform', 'voldoet_nev', 'voldoet_primair_verbruik', 'voldoet_isolatie',
-})
+# EPC-schema v2: metadata, gebouw, prestaties, installaties, aanbevelingen (zie prompts.py)
 
 
-def _normalize_epc_date(value: Any) -> Optional[str]:
-    """Return date in YYYY-MM-DD or None."""
+def _is_epc_source_leaf(v: Any) -> bool:
+    if not isinstance(v, dict) or "value" not in v:
+        return False
+    return all(k in ("value", "source_quote", "source_page", "word_ids") for k in v.keys())
+
+
+def _epc_coerce_int(value: Any) -> Optional[int]:
+    if _is_epc_source_leaf(value):
+        value = value.get("value")
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(round(value))
+    if isinstance(value, str):
+        s = value.strip().replace(",", ".").replace(" ", "")
+        if not s or s.lower() in ("n/a", "ontbreekt", "-"):
+            return None
+        try:
+            f = float(s)
+            return int(round(f))
+        except (ValueError, TypeError):
+            return None
+    return None
+
+
+def _epc_coerce_int_leaf(v: Any) -> Any:
+    """Integer of bronobject met genormaliseerde value."""
+    if _is_epc_source_leaf(v):
+        inner = _epc_coerce_int(v.get("value"))
+        return {**v, "value": inner}
+    return _epc_coerce_int(v)
+
+
+def _epc_str_leaf(v: Any) -> Any:
+    """String of bronobject met getrimde value."""
+    if _is_epc_source_leaf(v):
+        inner = v.get("value")
+        if inner is None:
+            return {**v, "value": None}
+        s = str(inner).strip() or None
+        return {**v, "value": s}
+    if isinstance(v, str):
+        return v.strip() or None
+    return v
+
+
+def _epc_normalize_dd_mm_yyyy(value: Any) -> Optional[str]:
+    """Datums naar DD/MM/YYYY (string) of None."""
     if value is None or value == "":
         return None
     if isinstance(value, str):
-        value = value.strip()
-        if not value or value.lower() in ("n/a", "ontbreekt"):
+        s = value.strip()
+        if not s or s.lower() in ("n/a", "ontbreekt"):
             return None
-        for fmt in ('%Y-%m-%d', '%d-%m-%Y', '%d/%m/%Y', '%Y/%m/%d', '%d.%m.%Y'):
+        for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d", "%d.%m.%Y", "%Y/%m/%d"):
             try:
-                return datetime.strptime(value, fmt).strftime('%Y-%m-%d')
+                return datetime.strptime(s, fmt).strftime("%d/%m/%Y")
             except ValueError:
                 continue
-    return str(value) if value else None
+    return None
+
+
+def try_regex_epc_fields(full_text: str) -> Dict[str, Any]:
+    """Optionele regex-hints (certificaatnummer, datums) — merge na AI indien AI null gaf."""
+    hints: Dict[str, Any] = {"metadata": {}}
+    if not full_text or len(full_text) < 30:
+        return {}
+    text = full_text.replace("\n", " ")
+    m = re.search(
+        r"(?:certificaat|attest|identificatie)(?:nummer)?\s*[:#]?\s*([A-Z0-9][A-Z0-9\-/_]{4,})",
+        text,
+        re.I,
+    )
+    if m:
+        hints["metadata"]["certificaat_nummer"] = m.group(1).strip()
+    for label, key in (
+        (r"geldig\s*(?:tot|tem|tot en met)\s*[:#]?\s*(\d{1,2}[./-]\d{1,2}[./-]\d{2,4})", "geldig_tot"),
+        (r"(?:datum\s*)?(?:opmaak|uitgifte)\s*[:#]?\s*(\d{1,2}[./-]\d{1,2}[./-]\d{2,4})", "datum_opmaak"),
+    ):
+        mm = re.search(label, text, re.I)
+        if mm:
+            norm = _epc_normalize_dd_mm_yyyy(mm.group(1))
+            if norm:
+                hints["metadata"][key] = norm
+    return {k: v for k, v in hints.items() if v}
+
+
+def _merge_epc_regex_metadata(meta: Dict[str, Any], hints: Dict[str, Any]) -> None:
+    """Vul ontbrekende metadata-velden met regex-hints."""
+    if not hints:
+        return
+    for k, v in hints.items():
+        if meta.get(k) in (None, "", []):
+            meta[k] = v
 
 
 def normalize_epc_data(epc_data: Dict[str, Any]) -> Dict[str, Any]:
-    """Normaliseer EPC-velden: datums YYYY-MM-DD, getallen als getal, strings getrimd."""
-    if not epc_data or epc_data.get('error'):
+    """Normaliseer genest EPC-schema: datums DD/MM/YYYY, integers, strings; behoud bronobjecten {value, source_quote, ...}."""
+    if not epc_data or epc_data.get("error"):
         return epc_data
-    out = {}
-    for k, v in epc_data.items():
-        if v is None:
-            out[k] = None
-            continue
-        if k in _EPC_DATE_KEYS:
-            out[k] = _normalize_epc_date(v)
-        elif k in _EPC_NUMERIC_KEYS:
-            if isinstance(v, (int, float)):
-                out[k] = v
-            elif isinstance(v, str):
-                v = v.strip().replace(",", ".")
-                try:
-                    out[k] = int(v) if "." not in v and "e" not in v.lower() else float(v)
-                except (ValueError, TypeError):
-                    out[k] = None
+
+    def norm_meta(m: Dict[str, Any]) -> Dict[str, Any]:
+        out: Dict[str, Any] = {}
+        for k in ("certificaat_nummer", "datum_opmaak", "geldig_tot", "energiedeskundige"):
+            v = m.get(k)
+            if k in ("datum_opmaak", "geldig_tot"):
+                if _is_epc_source_leaf(v):
+                    inner = _epc_normalize_dd_mm_yyyy(v.get("value"))
+                    out[k] = {**v, "value": inner}
+                else:
+                    out[k] = _epc_normalize_dd_mm_yyyy(v)
             else:
-                out[k] = None
-        elif k in _EPC_BOOL_KEYS:
-            if isinstance(v, bool):
-                out[k] = v
-            elif isinstance(v, str):
-                out[k] = v.strip().lower() in ('true', 'ja', 'yes', '1', 'x')
-            else:
-                out[k] = bool(v) if v is not None else None
-        elif isinstance(v, str):
-            out[k] = v.strip() or None
-        elif isinstance(v, list):
-            out[k] = [x.strip() if isinstance(x, str) else x for x in v] if v else []
-        else:
-            out[k] = v
-    return out
+                out[k] = _epc_str_leaf(v)
+        return out
+
+    def norm_gebouw(g: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "adres": _epc_str_leaf(g.get("adres")),
+            "referentie": _epc_str_leaf(g.get("referentie")),
+            "bouwjaar": _epc_coerce_int_leaf(g.get("bouwjaar")),
+            "oppervlakte_m2": _epc_coerce_int_leaf(g.get("oppervlakte_m2")),
+            "volume_m3": _epc_coerce_int_leaf(g.get("volume_m3")),
+        }
+
+    def norm_pres(p: Dict[str, Any]) -> Dict[str, Any]:
+        keys = (
+            "energiescore_kwh_m2",
+            "doelstelling_kwh_m2",
+            "primair_verbruik_kwh",
+            "co2_emissie_kg",
+            "s_peil",
+        )
+        return {k: _epc_coerce_int_leaf(p.get(k)) for k in keys}
+
+    def norm_inst(i: Dict[str, Any]) -> Dict[str, Any]:
+        out: Dict[str, Any] = {}
+        for k in ("verwarming", "sanitair_warm_water", "zonne_energie", "ventilatie"):
+            out[k] = _epc_str_leaf(i.get(k))
+        return out
+
+    def norm_aanbevelingen(arr: Any) -> list:
+        if not isinstance(arr, list):
+            return []
+        out_list = []
+        for item in arr:
+            if not isinstance(item, dict):
+                continue
+            out_list.append({
+                "onderdeel": _epc_str_leaf(item.get("onderdeel")),
+                "actie": _epc_str_leaf(item.get("actie")),
+                "prijs_min_eur": _epc_coerce_int_leaf(item.get("prijs_min_eur")),
+                "prijs_max_eur": _epc_coerce_int_leaf(item.get("prijs_max_eur")),
+            })
+        return out_list
+
+    meta = norm_meta(epc_data.get("metadata") or {})
+    gebouw = norm_gebouw(epc_data.get("gebouw") or {})
+    prestaties = norm_pres(epc_data.get("prestaties") or {})
+    installaties = norm_inst(epc_data.get("installaties") or {})
+    aanbevelingen = norm_aanbevelingen(epc_data.get("aanbevelingen"))
+
+    return {
+        "metadata": meta,
+        "gebouw": gebouw,
+        "prestaties": prestaties,
+        "installaties": installaties,
+        "aanbevelingen": aanbevelingen,
+    }
+
+
+def _epc_count_filled(obj: Any) -> Tuple[int, int]:
+    """Tel (gevuld, totaal) recursief voor confidence."""
+    filled, total = 0, 0
+    if obj is None:
+        return 0, 0
+    if isinstance(obj, dict):
+        if "value" in obj and not any(
+            k not in ("value", "source_quote", "source_page", "word_ids") for k in obj.keys()
+        ):
+            total += 1
+            w = obj.get("value")
+            if w is not None and w != "" and w != []:
+                filled += 1
+            return filled, total
+        for v in obj.values():
+            f, t = _epc_count_filled(v)
+            filled += f
+            total += t
+        return filled, total
+    if isinstance(obj, list):
+        for it in obj:
+            f, t = _epc_count_filled(it)
+            filled += f
+            total += t
+        return filled, total
+    total = 1
+    if obj != "" and obj != []:
+        filled = 1
+    return filled, total
 
 
 def calculate_confidence_epc(epc_data: Dict[str, Any]) -> Dict[str, Any]:
-    """Confidence voor EPC (voor ordening): kritieke velden zwaarder."""
+    """Confidence voor EPC v2: kritieke velden + volledigheid."""
+    meta = epc_data.get("metadata") or {}
+    gebouw = epc_data.get("gebouw") or {}
     critical = {
-        'adres': epc_data.get('adres'),
-        'energieklasse': epc_data.get('energieklasse'),
-        'vloeroppervlakte_m2': epc_data.get('vloeroppervlakte_m2') or epc_data.get('oppervlakte'),
-        'geldig_tot': epc_data.get('geldig_tot'),
+        "certificaat_nummer": _unwrap_field_value(meta.get("certificaat_nummer")),
+        "adres": _unwrap_field_value(gebouw.get("adres")),
+        "geldig_tot": _unwrap_field_value(meta.get("geldig_tot")),
+        "oppervlakte_m2": _unwrap_field_value(gebouw.get("oppervlakte_m2")),
     }
-    filled_critical = sum(1 for v in critical.values() if v is not None and v != '')
-    critical_score = (filled_critical / len(critical)) * 50  # 50 punten max
-    filled = sum(1 for v in epc_data.values() if v is not None and v != '' and v != [] and v != {})
-    total = len(epc_data)
-    completeness = (filled / total * 50) if total else 0  # 50 punten max
+    filled_critical = sum(1 for v in critical.values() if v is not None and v != "")
+    critical_score = (filled_critical / len(critical)) * 50
+    filled, total = _epc_count_filled(epc_data)
+    completeness = (filled / total * 50) if total else 0
     score = min(100, round(critical_score + completeness))
-    details = {}
+    details: Dict[str, Any] = {}
     if filled_critical < len(critical):
-        missing = [k for k, v in critical.items() if not v or v == '']
-        details['missing_critical'] = missing
+        details["missing_critical"] = [k for k, v in critical.items() if not v and v != 0]
     return {"score": score, "details": details}
 
 
-def extract_epc_document(full_text: str, gemini_client, model, extract_key_idx: Optional[int] = None) -> Dict[str, Any]:
-    """Extraheer EPC/EPB-velden uit een energieprestatiecertificaat. Retourneert dict of {'error': '...'}."""
+def extract_epc_data(
+    full_text: str,
+    gemini_client,
+    model,
+    extract_key_idx: Optional[int] = None,
+    all_words: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """
+    Multi-stage EPC-extractie (Vlaams schema): metadata, gebouw, prestaties, installaties, aanbevelingen.
+    Zelfde patroon als huurcontract: meerdere Gemini-calls + optionele word_ids.
+    """
+    regex_hints = try_regex_epc_fields(full_text)
+    if regex_hints:
+        print(f"   📐 EPC regex-hints: {list(regex_hints.keys())}")
+
     text_chunk_1 = full_text[:TEXT_CHUNK_1_SIZE]
     text_chunk_2 = full_text[TEXT_CHUNK_OVERLAP:TEXT_CHUNK_2_SIZE] if len(full_text) > TEXT_CHUNK_OVERLAP else ""
-    prompt = PROMPT_EPC.format(text_chunk_1=text_chunk_1, text_chunk_2=text_chunk_2)
-    for attempt in range(3):
-        try:
-            response = gemini_client.models.generate_content(
-                model=model,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    temperature=0.1,
-                    response_mime_type="application/json",
-                ),
-            )
-            raw = response.text.strip()
-            if raw.startswith("```"):
-                raw = raw.split("```")[1]
-                if raw.startswith("json"):
-                    raw = raw[4:]
-                raw = raw.strip()
-            data = json.loads(raw)
-            if extract_key_idx is not None:
-                record_extract_use(extract_key_idx)
-            return data
-        except json.JSONDecodeError:
-            if attempt < 2:
-                time.sleep(3)
-            else:
-                return {"error": "EPC_JSON_PARSE_FAILED"}
-        except Exception as e:
-            err = str(e)
-            if is_quota_error(err):
-                return {"error": "QUOTA_EXCEEDED", "details": err}
-            if is_api_key_error(err):
-                return {"error": "API_KEY_ERROR", "details": err}
-            if attempt < 2:
-                time.sleep(RETRY_WAIT)
-            else:
-                return {"error": "EPC_EXTRACT_FAILED", "details": err}
-    return {"error": "EPC_EXTRACT_FAILED"}
+    _ctx2_6k = text_chunk_2[:6000] if text_chunk_2 else ""
+
+    numbered_suffix = ""
+    if all_words and len(all_words) > 0:
+        numbered_chunk = build_numbered_prompt(all_words, TEXT_CHUNK_1_SIZE)
+        if numbered_chunk:
+            numbered_suffix = "\n\n" + WORD_IDS_INSTRUCTION + "\n\nGENUMBERDE TEKST (gebruik de [getal]-IDs voor word_ids):\n" + numbered_chunk
+            print(f"   📌 EPC Word IDs: {len(all_words)} woorden voor markering")
+
+    _sq = SOURCE_QUOTE_INSTRUCTION + numbered_suffix
+
+    stages = {
+        "metadata": PROMPT_EPC_METADATA.format(
+            text_chunk_1=text_chunk_1, text_chunk_2=_ctx2_6k, source_quote_instruction=_sq
+        ),
+        "gebouw": PROMPT_EPC_GEBOUW.format(
+            text_chunk_1=text_chunk_1, text_chunk_2=_ctx2_6k, source_quote_instruction=_sq
+        ),
+        "prestaties": PROMPT_EPC_PRESTATIES.format(
+            text_chunk_1=text_chunk_1, text_chunk_2=_ctx2_6k, source_quote_instruction=_sq
+        ),
+        "installaties": PROMPT_EPC_INSTALLATIES.format(
+            text_chunk_1=text_chunk_1, text_chunk_2=_ctx2_6k, source_quote_instruction=_sq
+        ),
+        "aanbevelingen": PROMPT_EPC_AANBEVELINGEN.format(
+            text_chunk_1=text_chunk_1, text_chunk_2=_ctx2_6k, source_quote_instruction=_sq
+        ),
+    }
+
+    extracted: Dict[str, Any] = {}
+
+    for stage_name, prompt in stages.items():
+        print(f"      📊 EPC extracting {stage_name}...")
+        stage_data: Dict[str, Any] = {}
+        for attempt in range(3):
+            try:
+                response = gemini_client.models.generate_content(
+                    model=model,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        temperature=0.1,
+                        response_mime_type="application/json",
+                    ),
+                )
+                raw = response.text.strip()
+                if raw.startswith("```"):
+                    raw = raw.split("```")[1]
+                    if raw.startswith("json"):
+                        raw = raw[4:]
+                    raw = raw.strip()
+                stage_data = json.loads(raw)
+                if extract_key_idx is not None:
+                    record_extract_use(extract_key_idx)
+                break
+            except json.JSONDecodeError:
+                print(f"         ⚠️  EPC JSON parse error ({stage_name}) attempt {attempt + 1}/3")
+                if attempt < 2:
+                    time.sleep(3)
+                else:
+                    stage_data = {}
+            except Exception as e:
+                err = str(e)
+                if is_quota_error(err):
+                    return {"error": "QUOTA_EXCEEDED", "details": err}
+                if is_api_key_error(err):
+                    return {"error": "API_KEY_ERROR", "details": err}
+                if "429" in err and attempt < 2:
+                    print("         ⚠️  Rate limit — waiting...")
+                    time.sleep(RETRY_WAIT)
+                else:
+                    print(f"         ❌ EPC {stage_name}: {str(e)[:120]}")
+                    stage_data = {}
+                    break
+
+        if stage_name == "aanbevelingen":
+            arr = stage_data.get("aanbevelingen")
+            extracted["aanbevelingen"] = arr if isinstance(arr, list) else []
+        else:
+            extracted[stage_name] = stage_data
+
+        time.sleep(12)
+
+    merged = {
+        "metadata": extracted.get("metadata") or {},
+        "gebouw": extracted.get("gebouw") or {},
+        "prestaties": extracted.get("prestaties") or {},
+        "installaties": extracted.get("installaties") or {},
+        "aanbevelingen": extracted.get("aanbevelingen") or [],
+    }
+    _merge_epc_regex_metadata(merged["metadata"], regex_hints.get("metadata") or {})
+
+    return merged
 
 
 def extract_contract_data(full_text, gemini_client, model, initial_data: Optional[Dict[str, dict]] = None, pages_text: Optional[List[Tuple[int, str]]] = None, extract_key_idx: Optional[int] = None, all_words: Optional[List[Dict[str, Any]]] = None, words_by_page: Optional[Dict[int, List[Dict[str, Any]]]] = None):
@@ -2636,6 +3165,12 @@ def extract_contract_data(full_text, gemini_client, model, initial_data: Optiona
 
     if pages_text:
         _add_source_pages(final_data, pages_text)
+
+    # PDF-fluor: genummerde prompt dekt niet altijd het hele document; vul word_ids uit source_quote + all_words.
+    # Onderverhuur: regex-bron als het model boolean-only gaf.
+    if all_words:
+        _ensure_onderverhuur_rich_field(final_data.get("voorwaarden") or {}, full_text)
+        _enrich_word_ids_from_source_quotes(final_data, all_words)
 
     # ========================================================================
     # VALIDATION & REPORTING
@@ -2904,10 +3439,15 @@ def process_rental_contract(clients, pdf_info):
         _, _, count, _ = extract_summary[key_idx]
         print(f"🔑 Extract key {key_idx + 1}/12 ({count}/{MAX_CALLS_PER_KEY_PER_24H} in 24u)")
 
-    # BELANGRIJK: Voeg direct toe aan history zodra processing start
-    # Dit voorkomt dat hetzelfde document meerdere keren wordt verwerkt
-    add_to_history(ANALYZED_HISTORY, pdf_info['path'])
-    print(f"   📝 Added to history: {pdf_info['path']}")
+    # Claim onder lock + verse history: voorkomt dubbele Gemini-run bij 2× script of race tussen workers
+    with _phase2_analysis_lock():
+        hist = load_history(ANALYZED_HISTORY)
+        norm_path = _normalize_dropbox_path(pdf_info['path'])
+        if norm_path in hist:
+            print(f"   ⏭️  Skip — staat al in analyzed_docs (andere worker of eerdere run): {norm_path}")
+            return {'success': True, 'skipped': True, 'already_done': True}
+        add_to_history(ANALYZED_HISTORY, pdf_info['path'])
+    print(f"   📝 Claimed for analysis: {pdf_info['path']}")
 
     try:
         print(f"\n{'='*70}")
@@ -2928,10 +3468,23 @@ def process_rental_contract(clients, pdf_info):
             print(f"⚠️  Too little text - skipping")
             return None
 
+        # Woord-niveau (zelfde als huurcontract) voor PDF-markering bij EPC + huur
+        words_by_page: Dict[int, List[Dict[str, Any]]] = {}
+        all_words: List[Dict[str, Any]] = []
+        if pdf_metadata.get("extraction_method") == "text" and response.content:
+            try:
+                words_by_page, all_words = extract_words_with_ids(response.content)
+            except Exception as we:
+                logger.warning(f"Word extraction skipped: {we}")
+
         doc_type = get_document_type_from_path_and_name(pdf_info.get('path') or '', pdf_info.get('name') or '')
         if doc_type == 'epc':
-            print("🤖 Gemini analyzing EPC document...")
-            epc_data = extract_epc_document(full_text, gemini, model, extract_key_idx=key_idx)
+            print("🤖 Gemini analyzing EPC document (multi-stage)...")
+            epc_data = extract_epc_data(
+                full_text, gemini, model,
+                extract_key_idx=key_idx,
+                all_words=all_words if all_words else None,
+            )
             if epc_data.get('error') == 'QUOTA_EXCEEDED':
                 remove_from_history(ANALYZED_HISTORY, pdf_info['path'])
                 return {'quota_error': True, 'requeue': True}
@@ -2942,16 +3495,24 @@ def process_rental_contract(clients, pdf_info):
                 print(f"❌ EPC extractie mislukt: {epc_data.get('error')}")
                 return None
             epc_data = normalize_epc_data(epc_data)
-            adres = epc_data.get('adres') or ''
+            gebouw = epc_data.get('gebouw') or {}
+            meta = epc_data.get('metadata') or {}
+            adres = _unwrap_field_value(gebouw.get('adres')) or ''
+            if isinstance(adres, str):
+                adres = adres.strip()
             normalized_data = {
                 "pand": {"adres": adres},
                 "epc_document": epc_data,
             }
             confidence = calculate_confidence_epc(epc_data)
-            klasse = epc_data.get('energieklasse') or '—'
-            opp = epc_data.get('vloeroppervlakte_m2') or epc_data.get('oppervlakte')
-            geldig = epc_data.get('geldig_tot') or '—'
-            summary = f"EPC: energieklasse {klasse}, oppervlakte {opp} m², geldig tot {geldig}. {epc_data.get('verkoop_argument_energie') or ''}".strip()
+            cert = _unwrap_field_value(meta.get('certificaat_nummer')) or '—'
+            opp = _unwrap_field_value(gebouw.get('oppervlakte_m2'))
+            geldig = _unwrap_field_value(meta.get('geldig_tot')) or '—'
+            score = _unwrap_field_value((epc_data.get('prestaties') or {}).get('energiescore_kwh_m2'))
+            summary = (
+                f"EPC: cert. {cert}, adres {adres or '—'}, score {score if score is not None else '—'} kWh/m², "
+                f"opp. {opp if opp is not None else '—'} m², geldig tot {geldig}."
+            ).strip()
             processing_time = time.time() - start_time
             print(f"✓ EPC verwerkt in {processing_time:.1f}s - Score: {confidence['score']}%")
             result = {
@@ -2965,17 +3526,10 @@ def process_rental_contract(clients, pdf_info):
                 "summary": summary,
                 "confidence": confidence,
                 "processing_time": processing_time,
-                "words_by_page": None,
+                "words_by_page": words_by_page if words_by_page else None,
             }
         else:
             # Word-level extraction for position-based PDF highlight (only when text came from text layer)
-            words_by_page = {}
-            all_words = []
-            if pdf_metadata.get("extraction_method") == "text" and response.content:
-                try:
-                    words_by_page, all_words = extract_words_with_ids(response.content)
-                except Exception as we:
-                    logger.warning(f"Word extraction skipped: {we}")
 
             # Extract raw data (huurcontract)
             print("🤖 Gemini analyzing contract...")
@@ -3264,8 +3818,15 @@ def analyze_rental_contracts(clients, analyzed_history):
     if len(all_pdfs) > 5:
         print(f"   ... and {len(all_pdfs) - 5} more")
 
-    # Filter out already analyzed
-    new_pdfs = [pdf for pdf in all_pdfs if pdf['path'] not in analyzed_history]
+    # Filter out already analyzed + unieke paden (zelfde PDF niet 2× in één batch)
+    seen_paths: Set[str] = set()
+    new_pdfs: List[Dict[str, Any]] = []
+    for pdf in all_pdfs:
+        pth = pdf.get("path") or ""
+        if pth in analyzed_history or pth in seen_paths:
+            continue
+        seen_paths.add(pth)
+        new_pdfs.append(pdf)
 
     if not new_pdfs:
         print("✅ All rental contracts already analyzed")
@@ -3287,6 +3848,10 @@ def analyze_rental_contracts(clients, analyzed_history):
         print(f"   Path: {pdf_info['path']}")
 
         result = process_rental_contract(clients, pdf_info)
+
+        if result and result.get("skipped"):
+            print(f"   ⏭️  Geen actie (dubbele claim vermeden): {pdf_info['path']}")
+            continue
 
         # Check if document was requeued (removed from history)
         if result and result.get('requeue'):
@@ -3367,7 +3932,8 @@ def main():
 
     folder_mgr = FolderManager(clients['dbx_organize'])
 
-    # Load history
+    # Dubbele regels in analyzed_docs.txt opruimen; daarna verse load
+    dedupe_history_file_on_disk(ANALYZED_HISTORY)
     organized_history = load_history(ORGANIZED_HISTORY)
     analyzed_history = load_history(ANALYZED_HISTORY)
 
