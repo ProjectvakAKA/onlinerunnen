@@ -328,6 +328,16 @@ MAX_RETRIES = 3
 RETRY_WAIT = 15
 RATE_LIMIT_WAIT = 90
 QUOTA_EXCEEDED_WAIT = 3600
+MAX_KEY_SWITCH_RETRIES = 3
+SERVICE_UNAVAILABLE_WAIT = 60
+MODEL_FALLBACK_CHAIN = [
+    "gemini-2.5-flash",
+    "gemini-2.5-pro",
+    "gemini-1.5-flash-latest",
+    "gemini-1.5-flash",
+    "gemini-1.5-pro",
+    "gemini-pro",
+]
 
 # Folders to exclude from organizing
 EXCLUDE_FOLDERS = {
@@ -1933,70 +1943,87 @@ def smart_classify(text: str, filename: str, current_location: str,
         text_for_call=text_for_call,
     )
 
-    for attempt in range(MAX_RETRIES):
-        try:
-            response = gemini_client.models.generate_content(
-                model=model,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    temperature=0.1,
-                    response_mime_type="application/json",
-                    max_output_tokens=4096,
-                ),
-            )
+    fallback_models = [m for m in MODEL_FALLBACK_CHAIN if isinstance(m, str) and m.strip() and m != model]
+    model_candidates = [model] + fallback_models
 
-            raw = response.text.strip()
-            result = _parse_json_from_response(raw)
+    for model_idx, current_model in enumerate(model_candidates):
+        if model_idx > 0:
+            print(f"   🔄 Switching model after unavailable error: {current_model}")
 
-            # Validate result
-            required_fields = ['action', 'folder_path', 'confidence', 'reasoning']
-            if not all(field in result for field in required_fields):
-                raise ValueError(f"Missing fields: {[f for f in required_fields if f not in result]}")
+        for attempt in range(MAX_RETRIES):
+            try:
+                response = gemini_client.models.generate_content(
+                    model=current_model,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        temperature=0.1,
+                        response_mime_type="application/json",
+                        max_output_tokens=4096,
+                    ),
+                )
 
-            if result['action'] not in ['existing', 'new']:
-                raise ValueError(f"Invalid action: {result['action']}")
+                raw = response.text.strip()
+                result = _parse_json_from_response(raw)
 
-            # Samenvatting (Plan stap 6 in dezelfde call)
-            result['summary'] = (result.get('summary') or '').strip() if isinstance(result.get('summary'), str) else ''
+                # Validate result
+                required_fields = ['action', 'folder_path', 'confidence', 'reasoning']
+                if not all(field in result for field in required_fields):
+                    raise ValueError(f"Missing fields: {[f for f in required_fields if f not in result]}")
 
-            # Clean folder path
-            folder_path = result['folder_path'].strip()
-            if not folder_path.startswith('/'):
-                folder_path = '/' + folder_path
+                if result['action'] not in ['existing', 'new']:
+                    raise ValueError(f"Invalid action: {result['action']}")
 
-            result['folder_path'] = folder_path
+                # Samenvatting (Plan stap 6 in dezelfde call)
+                result['summary'] = (result.get('summary') or '').strip() if isinstance(result.get('summary'), str) else ''
 
-            # FIX: niet-contracten NOOIT in /Onbekend_adres of /Contracten (AI negeert prompt soms)
-            result = _force_non_contract_out_of_contract_folders(result, filename)
+                # Clean folder path
+                folder_path = result['folder_path'].strip()
+                if not folder_path.startswith('/'):
+                    folder_path = '/' + folder_path
 
-            return result
+                result['folder_path'] = folder_path
 
-        except json.JSONDecodeError as e:
-            print(f"   ⚠️  JSON parse error: {str(e)[:100]}")
-            if attempt < MAX_RETRIES - 1:
-                print(f"   ⏳ Retry in {RETRY_WAIT}s...")
-                time.sleep(RETRY_WAIT)
-                continue
-            else:
-                return None
+                # FIX: niet-contracten NOOIT in /Onbekend_adres of /Contracten (AI negeert prompt soms)
+                result = _force_non_contract_out_of_contract_folders(result, filename)
 
-        except Exception as e:
-            error_str = str(e)
+                return result
 
-            if "429" in error_str or "quota" in error_str.lower() or "resource_exhausted" in error_str.lower():
-                print(f"   ⚠️  Rate limit reached")
+            except json.JSONDecodeError as e:
+                print(f"   ⚠️  JSON parse error ({current_model}): {str(e)[:100]}")
                 if attempt < MAX_RETRIES - 1:
-                    wait_time = RATE_LIMIT_WAIT * (attempt + 1)
-                    print(f"   ⏳ Waiting {wait_time}s...")
-                    time.sleep(wait_time)
+                    print(f"   ⏳ Retry in {RETRY_WAIT}s...")
+                    time.sleep(RETRY_WAIT)
                     continue
+                break
 
-            print(f"   ❌ Classification error: {str(e)[:100]}")
-            if attempt < MAX_RETRIES - 1:
-                time.sleep(RETRY_WAIT)
-                continue
+            except Exception as e:
+                error_str = str(e)
+                error_lower = error_str.lower()
 
-            return None
+                if "429" in error_str or "quota" in error_lower or "resource_exhausted" in error_lower:
+                    print(f"   ⚠️  Rate limit reached ({current_model})")
+                    if attempt < MAX_RETRIES - 1:
+                        wait_time = RATE_LIMIT_WAIT * (attempt + 1)
+                        print(f"   ⏳ Waiting {wait_time}s...")
+                        time.sleep(wait_time)
+                        continue
+                    break
+
+                is_unavailable = (
+                    "503" in error_str
+                    or "service unavailable" in error_lower
+                    or "currently experiencing high demand" in error_lower
+                    or "unavailable" in error_lower
+                )
+                if is_unavailable and model_idx < len(model_candidates) - 1:
+                    print(f"   ⚠️  {current_model} unavailable (503/high demand), trying fallback model...")
+                    break
+
+                print(f"   ❌ Classification error ({current_model}): {str(e)[:100]}")
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(RETRY_WAIT)
+                    continue
+                break
 
     return None
 
@@ -2966,48 +2993,79 @@ def extract_epc_data(
 
     extracted: Dict[str, Any] = {}
 
+    fallback_models = [m for m in MODEL_FALLBACK_CHAIN if isinstance(m, str) and m.strip() and m != model]
+    model_candidates = [model] + fallback_models
+
     for stage_name, prompt in stages.items():
         print(f"      📊 EPC extracting {stage_name}...")
         stage_data: Dict[str, Any] = {}
-        for attempt in range(3):
-            try:
-                response = gemini_client.models.generate_content(
-                    model=model,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        temperature=0.1,
-                        response_mime_type="application/json",
-                    ),
-                )
-                raw = response.text.strip()
-                if raw.startswith("```"):
-                    raw = raw.split("```")[1]
-                    if raw.startswith("json"):
-                        raw = raw[4:]
-                    raw = raw.strip()
-                stage_data = json.loads(raw)
-                if extract_key_idx is not None:
-                    record_extract_use(extract_key_idx)
-                break
-            except json.JSONDecodeError:
-                print(f"         ⚠️  EPC JSON parse error ({stage_name}) attempt {attempt + 1}/3")
-                if attempt < 2:
-                    time.sleep(3)
-                else:
-                    stage_data = {}
-            except Exception as e:
-                err = str(e)
-                if is_quota_error(err):
-                    return {"error": "QUOTA_EXCEEDED", "details": err}
-                if is_api_key_error(err):
-                    return {"error": "API_KEY_ERROR", "details": err}
-                if "429" in err and attempt < 2:
-                    print("         ⚠️  Rate limit — waiting...")
-                    time.sleep(RETRY_WAIT)
-                else:
+        stage_done = False
+        for model_idx, current_model in enumerate(model_candidates):
+            if model_idx > 0:
+                print(f"         🔄 EPC fallback model: {current_model}")
+            attempt = 0
+            while attempt < 3:
+                try:
+                    response = gemini_client.models.generate_content(
+                        model=current_model,
+                        contents=prompt,
+                        config=types.GenerateContentConfig(
+                            temperature=0.1,
+                            response_mime_type="application/json",
+                        ),
+                    )
+                    raw = response.text.strip()
+                    if raw.startswith("```"):
+                        raw = raw.split("```")[1]
+                        if raw.startswith("json"):
+                            raw = raw[4:]
+                        raw = raw.strip()
+                    stage_data = json.loads(raw)
+                    if extract_key_idx is not None:
+                        record_extract_use(extract_key_idx)
+                    stage_done = True
+                    break
+                except json.JSONDecodeError:
+                    attempt += 1
+                    print(f"         ⚠️  EPC JSON parse error ({stage_name}) attempt {attempt}/3")
+                    if attempt < 3:
+                        time.sleep(3)
+                    else:
+                        stage_data = {}
+                except Exception as e:
+                    err = str(e)
+                    err_l = err.lower()
+                    if is_quota_error(err):
+                        return {"error": "QUOTA_EXCEEDED", "details": err}
+                    if is_api_key_error(err):
+                        return {"error": "API_KEY_ERROR", "details": err}
+                    if "429" in err and attempt < 2:
+                        attempt += 1
+                        print("         ⚠️  Rate limit — waiting...")
+                        time.sleep(RETRY_WAIT)
+                        continue
+                    is_unavailable = (
+                        "503" in err
+                        or "service unavailable" in err_l
+                        or "currently experiencing high demand" in err_l
+                        or "unavailable" in err_l
+                    )
+                    if is_unavailable:
+                        print(f"         ⚠️  Model unavailable (503/high demand), waiting {SERVICE_UNAVAILABLE_WAIT}s...")
+                        time.sleep(SERVICE_UNAVAILABLE_WAIT)
+                        # Tijdelijke overbelasting: blijf wachten/retryen in deze stage.
+                        continue
                     print(f"         ❌ EPC {stage_name}: {str(e)[:120]}")
                     stage_data = {}
                     break
+            if stage_done:
+                break
+        if not stage_done:
+            return {
+                "error": "STAGE_FAILED",
+                "stage": stage_name,
+                "details": f"EPC stage '{stage_name}' kon niet succesvol worden afgerond"
+            }
 
         if stage_name == "aanbevelingen":
             arr = stage_data.get("aanbevelingen")
@@ -3079,65 +3137,98 @@ def extract_contract_data(full_text, gemini_client, model, initial_data: Optiona
     }
 
     # Prompts staan in prompts.py
+    fallback_models = [m for m in MODEL_FALLBACK_CHAIN if isinstance(m, str) and m.strip() and m != model]
+    model_candidates = [model] + fallback_models
+
     for stage_name, prompt in stages.items():
         print(f"      📊 Extracting {stage_name}...")
         # Altijd AI-extractie per stage (geen skip op basis van regex), zodat we alle velden krijgen.
         # initial_data van regex wordt niet meer gebruikt om stages over te slaan.
-        for attempt in range(3):
-            try:
-                response = gemini_client.models.generate_content(
-                    model=model,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        temperature=0.1,
-                        response_mime_type="application/json"
+        stage_done = False
+        for model_idx, current_model in enumerate(model_candidates):
+            if model_idx > 0:
+                print(f"         🔄 Fallback model: {current_model}")
+            attempt = 0
+            while attempt < 3:
+                try:
+                    response = gemini_client.models.generate_content(
+                        model=current_model,
+                        contents=prompt,
+                        config=types.GenerateContentConfig(
+                            temperature=0.1,
+                            response_mime_type="application/json"
+                        )
                     )
-                )
 
-                # Parse JSON
-                raw = response.text.strip()
+                    # Parse JSON
+                    raw = response.text.strip()
 
-                # Clean up mogelijk markdown
-                if raw.startswith("```"):
-                    raw = raw.split("```")[1]
-                    if raw.startswith("json"):
-                        raw = raw[4:]
-                    raw = raw.strip()
+                    # Clean up mogelijk markdown
+                    if raw.startswith("```"):
+                        raw = raw.split("```")[1]
+                        if raw.startswith("json"):
+                            raw = raw[4:]
+                        raw = raw.strip()
 
-                stage_data = json.loads(raw)
-                extracted_sections[stage_name] = stage_data
+                    stage_data = json.loads(raw)
+                    extracted_sections[stage_name] = stage_data
 
-                # Count extracted fields
-                non_null_count = sum(1 for v in json.dumps(stage_data).split()
-                                     if v not in ['null', 'None', '""', '{}', '[]',"ONTBREKEND"])
-                print(f"         ✓ {non_null_count} data points extracted")
-                if extract_key_idx is not None:
-                    record_extract_use(extract_key_idx)
-                break
+                    # Count extracted fields
+                    non_null_count = sum(1 for v in json.dumps(stage_data).split()
+                                         if v not in ['null', 'None', '""', '{}', '[]',"ONTBREKEND"])
+                    print(f"         ✓ {non_null_count} data points extracted")
+                    if extract_key_idx is not None:
+                        record_extract_use(extract_key_idx)
+                    stage_done = True
+                    break
 
-            except json.JSONDecodeError as e:
-                print(f"         ⚠️  JSON parse error (attempt {attempt + 1}/3)")
-                if attempt < 2:
-                    time.sleep(3)
-                else:
-                    print(f"         ❌ Failed to extract {stage_name}")
-                    extracted_sections[stage_name] = {}
+                except json.JSONDecodeError as e:
+                    attempt += 1
+                    print(f"         ⚠️  JSON parse error (attempt {attempt}/3)")
+                    if attempt < 3:
+                        time.sleep(3)
+                    else:
+                        print(f"         ❌ Failed to extract {stage_name}")
+                        extracted_sections[stage_name] = {}
 
-            except Exception as e:
-                error_msg = str(e)
-                if is_quota_error(error_msg):
-                    return {"error": "QUOTA_EXCEEDED", "details": error_msg}
-                
-                if is_api_key_error(error_msg):
-                    return {"error": "API_KEY_ERROR", "details": error_msg}
+                except Exception as e:
+                    error_msg = str(e)
+                    error_lower = error_msg.lower()
+                    if is_quota_error(error_msg):
+                        return {"error": "QUOTA_EXCEEDED", "details": error_msg}
 
-                if "429" in error_msg and attempt < 2:
-                    print(f"         ⚠️  Rate limit - waiting...")
-                    time.sleep(RETRY_WAIT)
-                else:
+                    if is_api_key_error(error_msg):
+                        return {"error": "API_KEY_ERROR", "details": error_msg}
+
+                    if "429" in error_msg and attempt < 2:
+                        attempt += 1
+                        print(f"         ⚠️  Rate limit - waiting...")
+                        time.sleep(RETRY_WAIT)
+                        continue
+
+                    is_unavailable = (
+                        "503" in error_msg
+                        or "service unavailable" in error_lower
+                        or "currently experiencing high demand" in error_lower
+                        or "unavailable" in error_lower
+                    )
+                    if is_unavailable:
+                        print(f"         ⚠️  Model unavailable (503/high demand), waiting {SERVICE_UNAVAILABLE_WAIT}s...")
+                        time.sleep(SERVICE_UNAVAILABLE_WAIT)
+                        # Tijdelijke overbelasting: blijf wachten/retryen in deze stage.
+                        continue
+
                     print(f"         ❌ Error: {str(e)[:100]}")
                     extracted_sections[stage_name] = {}
                     break
+            if stage_done:
+                break
+        if not stage_done:
+            return {
+                "error": "STAGE_FAILED",
+                "stage": stage_name,
+                "details": f"Contract stage '{stage_name}' kon niet succesvol worden afgerond"
+            }
 
         # Rate limiting tussen stages - 5 RPM = min 12 seconden tussen requests
         # 7 stages per contract, dus min 12s tussen elke stage
@@ -3419,7 +3510,7 @@ def generate_summary(full_text: str, doc_type: str, gemini_client, model, extrac
 # PHASE 2: PROCESS RENTAL CONTRACT
 # ============================================================================
 
-def process_rental_contract(clients, pdf_info):
+def process_rental_contract(clients, pdf_info, key_switch_attempt: int = 0):
     """Process and analyze a rental contract. Gebruikt rotator: 12 extract-keys (KEY_9..20), max 18/24u per key."""
     start_time = time.time()
     dbx_analyze = clients['dbx_analyze']
@@ -3438,6 +3529,32 @@ def process_rental_contract(clients, pdf_info):
     if key_idx < len(extract_summary):
         _, _, count, _ = extract_summary[key_idx]
         print(f"🔑 Extract key {key_idx + 1}/12 ({count}/{MAX_CALLS_PER_KEY_PER_24H} in 24u)")
+    if key_switch_attempt > 0:
+        print(f"   ↪️  Key switch retry {key_switch_attempt}/{MAX_KEY_SWITCH_RETRIES}")
+
+    def _retry_with_next_key(reason: str, details: str = ""):
+        # Tel deze key mee zodat de volgende selectie waarschijnlijk een andere key kiest.
+        if key_idx is not None and key_idx >= 0:
+            record_extract_use(key_idx)
+        remove_from_history(ANALYZED_HISTORY, pdf_info['path'])
+
+        if key_switch_attempt < MAX_KEY_SWITCH_RETRIES:
+            print(f"   🔁 {reason} - switching to next key (attempt {key_switch_attempt + 1}/{MAX_KEY_SWITCH_RETRIES})")
+            if details:
+                print(f"      details: {details[:140]}")
+            time.sleep(2)
+            return process_rental_contract(clients, pdf_info, key_switch_attempt=key_switch_attempt + 1)
+
+        payload = {'requeue': True}
+        if reason == "QUOTA_EXCEEDED":
+            payload['quota_error'] = True
+        elif reason == "API_KEY_ERROR":
+            payload['api_key_error'] = True
+        else:
+            payload['error'] = True
+        if details:
+            payload['error_msg'] = details
+        return payload
 
     # Claim onder lock + verse history: voorkomt dubbele Gemini-run bij 2× script of race tussen workers
     with _phase2_analysis_lock():
@@ -3486,13 +3603,13 @@ def process_rental_contract(clients, pdf_info):
                 all_words=all_words if all_words else None,
             )
             if epc_data.get('error') == 'QUOTA_EXCEEDED':
-                remove_from_history(ANALYZED_HISTORY, pdf_info['path'])
-                return {'quota_error': True, 'requeue': True}
+                return _retry_with_next_key('QUOTA_EXCEEDED', epc_data.get('details', 'EPC extract quota'))
             if epc_data.get('error') == 'API_KEY_ERROR':
-                remove_from_history(ANALYZED_HISTORY, pdf_info['path'])
-                return {'api_key_error': True, 'requeue': True}
+                return _retry_with_next_key('API_KEY_ERROR', epc_data.get('details', 'EPC extract key error'))
             if epc_data.get('error'):
                 print(f"❌ EPC extractie mislukt: {epc_data.get('error')}")
+                if epc_data.get('error') == 'STAGE_FAILED':
+                    print(f"   ❌ EPC stage failed: {epc_data.get('stage')}")
                 return None
             epc_data = normalize_epc_data(epc_data)
             gebouw = epc_data.get('gebouw') or {}
@@ -3543,23 +3660,23 @@ def process_rental_contract(clients, pdf_info):
 
             if contract_data.get('error') == 'QUOTA_EXCEEDED':
                 print(f"❌ QUOTA EXCEEDED - requeuing document for retry")
-                remove_from_history(ANALYZED_HISTORY, pdf_info['path'])
-                return {'quota_error': True, 'requeue': True}
+                return _retry_with_next_key('QUOTA_EXCEEDED', contract_data.get('details', 'Contract extract quota'))
             if contract_data.get('error') == 'API_KEY_ERROR':
                 print(f"❌ API KEY ERROR - requeuing document for retry")
+                return _retry_with_next_key('API_KEY_ERROR', contract_data.get('details', 'Contract extract key error'))
+            if contract_data.get('error') == 'STAGE_FAILED':
+                print(f"❌ STAGE FAILED - stopping contract extraction at stage: {contract_data.get('stage')}")
                 remove_from_history(ANALYZED_HISTORY, pdf_info['path'])
-                return {'api_key_error': True, 'requeue': True}
+                return {'error': True, 'requeue': True, 'error_msg': contract_data.get('details', 'Stage failed')}
 
             normalized_data = normalizer.normalize(contract_data)
             confidence = calculate_confidence_normalized(normalized_data, full_text, "huurovereenkomst", True)
             summary = generate_summary(full_text, "huurovereenkomst", gemini, model, extract_key_idx=key_idx)
 
             if "QUOTA_EXCEEDED" in summary:
-                remove_from_history(ANALYZED_HISTORY, pdf_info['path'])
-                return {'quota_error': True, 'requeue': True}
+                return _retry_with_next_key('QUOTA_EXCEEDED', 'Summary quota exceeded')
             if "API_KEY_ERROR" in summary or is_api_key_error(summary):
-                remove_from_history(ANALYZED_HISTORY, pdf_info['path'])
-                return {'api_key_error': True, 'requeue': True}
+                return _retry_with_next_key('API_KEY_ERROR', str(summary))
 
             processing_time = time.time() - start_time
             print(f"✓ Processed in {processing_time:.1f}s - Score: {confidence['score']}%")
@@ -3755,14 +3872,12 @@ Duration: {duur}
         # Check if it's an API key error
         if is_api_key_error(error_msg):
             print(f"   🔄 API Key error detected - requeuing document for retry")
-            remove_from_history(ANALYZED_HISTORY, pdf_info['path'])
-            return {'api_key_error': True, 'requeue': True, 'error': error_msg}
+            return _retry_with_next_key('API_KEY_ERROR', error_msg)
         
         # Check if it's a quota error
         if is_quota_error(error_msg):
             print(f"   🔄 Quota error detected - requeuing document for retry")
-            remove_from_history(ANALYZED_HISTORY, pdf_info['path'])
-            return {'quota_error': True, 'requeue': True, 'error': error_msg}
+            return _retry_with_next_key('QUOTA_EXCEEDED', error_msg)
         
         # For other errors, also requeue (but log the error)
         print(f"   🔄 Unknown error - requeuing document for retry")

@@ -1,20 +1,3 @@
-/Beukenhof_14B_huurcontract.pdf
-/Prinsengracht_456_huurcontract.pdf
-/Maria-Theresiastraat_78_bus_4_huurcontract.pdf
-/Meir_78_bus_3_huurcontract.pdf
-/Louizalaan_210_bus_5_huurcontract.pdf
-/Lijsterlaan_88_huurcontract.pdf
-/Kortrijksesteenweg_112_bus_3_huurcontract.pdf
-/Kapelstraat_29_huurcontract.pdf
-/huurovereenkomst 3.pdf
-/handelshuurovereenkomst.pdf
-/huurovereenkomst_aerts.pdf
-/huurovereenkomst_claes_brugge.pdf
-/huurovereenkomst_hendrickx_mechelen.pdf
-/huurovereenkomst_dubois_gent.pdf
-/huurovereenkomst_10_smeets_tongeren.pdf
-/huurovereenkomst_01_peters_hasselt.pdf
-/202603161.pdf
-/huurovereenkomst_07_hermans_genk.pdf
-/huurovereenkomst_08_claeys_ieper.pdf
-/huurovereenkomst_09_vanden_bruggen_roeselare.pdf
+
+/Capronstraat_29_huurcontract.pdf
+/Place_du_Marche_11_bus_2_huurcontract.pdf
